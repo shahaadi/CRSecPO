@@ -153,13 +153,16 @@ def validate_preference_record(
     record: Mapping[str, Any],
     *,
     row_index: int | None = None,
+    allow_arbitrary_reference: bool = False,
 ) -> PreferenceExample:
     """Validate and normalize one input record.
 
     A record must provide ``prompt``, ``chosen``, and ``rejected``, plus either
     an explicit ``clean_prompt`` or the exact injected substring in
     ``rejected_input_whole``. If both clean representations are present, they
-    must agree byte-for-byte. Unknown fields are rejected.
+    must agree byte-for-byte. Unknown fields are rejected. The explicit
+    ``allow_arbitrary_reference`` opt-in permits non-deletion reference contexts;
+    the released deletion invariant remains the default.
     """
 
     if not isinstance(record, Mapping):
@@ -218,11 +221,12 @@ def validate_preference_record(
         assert derived_clean is not None
         clean_prompt = derived_clean
 
-    _validate_single_deletion(
-        prompt,
-        clean_prompt,
-        row_index=row_index,
-    )
+    if not allow_arbitrary_reference:
+        _validate_single_deletion(
+            prompt,
+            clean_prompt,
+            row_index=row_index,
+        )
 
     example_id = record.get("id")
     # ``datasets.Dataset`` represents a missing value as None when only some
@@ -322,11 +326,14 @@ def build_input_and_labels(
     prompt_ids: Sequence[int],
     response_ids: Sequence[int],
     max_length: int,
+    *,
+    truncate_prompt: bool = True,
 ) -> tuple[list[int], list[int]]:
     """Join a prompt and response, left-truncating only the prompt.
 
     At least one prompt token is retained so that the first response token has
-    causal context. Responses are never silently truncated.
+    causal context. Responses are never silently truncated. Set
+    ``truncate_prompt=False`` to fail when the full sequence exceeds the budget.
     """
 
     if not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 2:
@@ -343,6 +350,11 @@ def build_input_and_labels(
             "responses are not truncated"
         )
 
+    if not truncate_prompt and len(prompt) + len(response) > max_length:
+        raise ValueError(
+            f"full sequence has {len(prompt) + len(response)} tokens but "
+            f"max_length={max_length}; prompt truncation is disabled"
+        )
     prompt_budget = max_length - len(response)
     prompt = prompt[-prompt_budget:]
     input_ids = prompt + response
@@ -358,6 +370,8 @@ class BenignReferenceCollator:
     max_length: int
     max_prompt_length: int | None = None
     append_eos: bool = True
+    allow_arbitrary_reference: bool = False
+    truncate_prompt: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -445,7 +459,10 @@ class BenignReferenceCollator:
         }
 
         for row_index, raw_feature in enumerate(features):
-            example = validate_preference_record(raw_feature, row_index=row_index)
+            example = validate_preference_record(
+                raw_feature, row_index=row_index,
+                allow_arbitrary_reference=self.allow_arbitrary_reference,
+            )
             attacked_prompt = self._tokenize(example.prompt)
             clean_prompt = self._tokenize(example.clean_prompt)
             chosen = self._tokenize_response(example.chosen)
@@ -478,6 +495,7 @@ class BenignReferenceCollator:
                     prompt_ids,
                     response_ids,
                     self.max_length,
+                    truncate_prompt=self.truncate_prompt,
                 )
                 blocks[name].append(input_ids)
                 label_blocks[name].append(labels)

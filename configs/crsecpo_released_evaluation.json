@@ -1,0 +1,28 @@
+{
+  "model": {
+    "model_id": "allenai/llama2-7b-WildJailbreak",
+    "model_revision": "1d1268a5cc81d1a81c85649fe911f893c167265e",
+    "tokenizer_id": "allenai/llama2-7b-WildJailbreak",
+    "tokenizer_revision": "1d1268a5cc81d1a81c85649fe911f893c167265e"
+  },
+  "judge_model": {
+    "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "model_revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+    "tokenizer_id": "meta-llama/Llama-3.1-8B-Instruct",
+    "tokenizer_revision": "0e9e39f249a16976918f6564b8830bc894c89659"
+  },
+  "device": "cuda",
+  "judge_device": "cuda",
+  "dtype": "bfloat16",
+  "seed": 42,
+  "generation": {
+    "max_new_tokens": 1024,
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "judge_generation": {
+    "max_new_tokens": 384,
+    "temperature": 0.0,
+    "top_p": 1.0
+  }
+}

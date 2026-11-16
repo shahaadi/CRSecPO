@@ -1,5 +1,7 @@
 # SecPO: Principled Adversarial Training for Prompt Injection Security
 
+This fork also contains [Combined-Reference SecPO (CRSecPO) experiment scaffolding](#crsecpo-experiment-scaffolding). It reuses Chen et al.'s loss and trainer; the original SecPO commands retain their default behavior.
+
 [[Paper]](https://arxiv.org/pdf/2610.41998) [Sizhe Chen](https://sizhe-chen.github.io), [Yibo Peng](https://pppyb.github.io/), [Jaewon Chang](https://www.jaewon.io/), [Chawin Sitawarin](https://chawin.sitawarin.com/), [David Wagner](https://people.eecs.berkeley.edu/~daw)
 
 Recognized as a top threat to AI agents, prompt injection allows instructions from untrusted data (email, documents, websites) to manipulate the agent’s operation. The existing best-defended LLM, Meta-SecAlign, is trained with the DPO loss but still suffers from attack success rates (ASRs) approaching 100% under adaptive prompt injections. One reason is that DPO anchors the model around the undefended reference model, which is insecure. We show an idealized reference model—an injection-invariant, utility-preserving oracle—can nevertheless be approximated, as its output distribution in training is interestingly accessible. This new observation motivates a theoretically principled SecPO loss. Another Meta-SecAlign shortcoming is that it trains on weak simulated attacks. We implement an efficient adversarial training (AT) pipeline that synthesizes strong injected inputs (best@240), and train the model on them. Our AT reduces ASRs by 1.5–14.5× across three SoTA adaptive attacks, compared with Meta-SecAlign; the SecPO loss reduces them by a further 2.4–4.6× compared with using DPO loss. In agentic workflows, our SecPO + AT Qwen3.6-27B is much more secure than Meta-SecAlign: 8.8% vs. 78.8% AgentDojo ASR@800 under the AttackerMovesSecond attack. Moreover, our defended model shows no noticeable reduction in benign utility in nine benchmarks covering agentic tool calling, instruction following, science, and math.
@@ -714,3 +716,407 @@ decoding (SD) on Qwen3.6-27B.
   url           = {https://arxiv.org/abs/2610.41998}
 }
 ```
+
+## CRSecPO experiment scaffolding
+
+CRSecPO adapts SecPO to existing benign-framing requests. It changes the frozen
+reference's prompt, not Chen et al.'s loss. This section documents executable
+scaffolding, not measured model results. The existing online attack controllers
+and released injection experiments remain available unchanged.
+
+### What is reused and what changes
+
+| Component | Implementation |
+| --- | --- |
+| Preference loss, sequence log probabilities, frozen adapter-disabled reference | Original `src/secpo/loss.py` and `trainer.py`, unchanged |
+| Model/revision loading, LoRA, optimizer and Trainer arguments | Original `training_cli.py` helpers, unchanged |
+| Tokenization, masks, padding, four scoring paths | Original `data.py`, with opt-in arbitrary references and no prompt truncation; old defaults unchanged |
+| SFT | Hugging Face `Trainer` on the same accepted chosen responses and response-only labels |
+| Combined/source-omitted prompts, swapped preference judgments, local inference | New `src/secpo/crsecpo/{prompts,pairs,inference}.py`; adapts the earlier project's prompt design and reuses upstream JSONL helpers |
+| Review-export adapter, leakage grouping, evaluation-file transport | New `records.py`; does not modify the running review service or its database |
+| Safety and utility evaluation | New `evaluation.py`; reuses upstream record I/O, official IFEval scoring, and the official GSM8K answer checker |
+| Public input checks and GPU-host readiness | New `assets.py`, pinned `configs/crsecpo_inputs.json` |
+
+The three core methods use one frozen pair file, the same example order, seed,
+LoRA configuration and sequence limits. Both preference methods score both answers
+under the target-only policy prompt. Ordinary DPO also uses that prompt for the
+reference; CRSecPO uses `clean_prompt`, here the combined source/target/rubric
+prompt. `rubric_only` changes only reference scoring to the same wrapper with an
+empty source. Its responses still come from the common pair file.
+
+The shared preparation checks **all** contexts for every method, including SFT.
+Overlong examples or token-identical answer pairs fail with IDs; no method silently
+truncates or receives an easier subset. Resolve eligibility once and write a new
+common pair file if necessary. Native Llama end-of-turn tokens are retained.
+The new methods use `python -m secpo.crsecpo...`; original `secpo-train` still runs
+the original injection recipe.
+
+### Preparation and data
+
+Install the upstream pinned dependencies on the intended host:
+
+```bash
+python -m pip install -e '.[test]'
+```
+
+Inspect the host without downloading weights or running inference:
+
+```bash
+python -m secpo.crsecpo.assets --report-only
+python -m secpo.crsecpo.assets --report-only --check-model-access
+```
+
+The second command optionally checks authenticated Hub file metadata using the
+existing login. The report lists missing/mismatched inputs, installed versions,
+and GPU/device memory information. Access or cached files do not establish
+inference, throughput, affordability, or scientific readiness. Reports do not
+print credentials or signed download URLs. When ready, fetch the public inputs:
+
+```bash
+python -m secpo.crsecpo.assets --fetch
+```
+
+That command fetches and verifies the small public evaluation/utility files only.
+Use `--download-model` to fetch the pinned official Llama safetensors with the
+host's approved Hugging Face login, and `--smoke-model` to verify local inference.
+No command rents a GPU or uses an external inference API. Do not run the 8B model
+on the reviewing laptop just to exercise the scaffold; fixture tests need no weights.
+The separate released WildJailbreak Llama-2 comparator still needs its own access.
+The portable asset manifest is generated from the existing research input lock;
+verify it with `python -m secpo.crsecpo.assets --source-lock /path/to/experiment/configs/crsecpo_inputs.lock.json`.
+Its recorded source hash identifies the lock used; laptop access checks are not
+treated as proof of GPU-host readiness.
+
+The filtering process elsewhere in the workspace owns all original training rows,
+three reviewer outputs, and accepted/unsure/rejected/unreviewed piles. Consume a
+frozen `master.tsv` export here. Acceptance alone is insufficient if policy or
+selection-group judgments disagree: those records remain quarantined.
+
+Prepare the separate held-out pool for the **same existing review pipeline**:
+
+```bash
+python -m secpo.crsecpo.records evaluation-tsv \
+  --harmful outputs/crsecpo/assets/harmful.jsonl \
+  --benign outputs/crsecpo/assets/benign.jsonl \
+  --revision 060cc903d64703214c549b5c3a30ea8ceef2e588 \
+  --output outputs/crsecpo/assets/eval.tsv
+```
+
+This adapter retains every original JSON record and provenance in added columns;
+the command verifies both raw files and their revision against the existing
+asset lock. It is not represented as an original publisher TSV release. Import it into a
+**separate** review database with partition `eval`, then run the existing three
+blinded reviewers using the frozen rubric. Do not reuse the training queue's
+database or output directory. Filtering test prompts is independent of checkpoint
+failures and preference-pair acceptance.
+
+Prepare separate human audits from frozen exports, using the same policy and
+eligibility criteria as filtering in a frozen plain-text rubric:
+
+```bash
+python -m secpo.crsecpo.preparation audit-export \
+  --training-export /path/to/training/master.tsv \
+  --evaluation-export /path/to/evaluation/master.tsv \
+  --rubric /path/to/frozen-human-rubric.txt \
+  --per-stratum 10 --seed 42 --output-dir outputs/crsecpo/human-audit
+python -m secpo.crsecpo.preparation audit-ingest \
+  --packet-dir outputs/crsecpo/human-audit \
+  --responses /path/to/completed-human-1.jsonl \
+  --reviewer human_1 --person-id teammate-a --independent-review
+# Repeat ingestion for human_2 with a different person ID.
+python -m secpo.crsecpo.preparation audit-report \
+  --packet-dir outputs/crsecpo/human-audit \
+  --output-dir outputs/crsecpo/human-audit-report
+```
+
+Each person receives only their form and `instructions.json`, and completes a
+copy independently. Do not share the coordinator key or the other person's
+findings. Forms hide machine votes and publisher labels/completions. Sampling is
+stratified by split, publisher pool, and machine status, including excluded and
+unresolved rows. Source-only forms display the source as the classification target,
+while retaining the absent-rewrite flag and raw fields in the coordinator key.
+Separate findings never overwrite machine reviews; potential
+errors require adjudication. Aggregate sample rates are not population estimates.
+
+For near-duplicate/control review, supply candidate IDs in JSONL with
+`{"kind":"family","left":"ID","right":"ID"}` or
+`{"kind":"control","left":"HARMFUL_TEST_ID","right":"BENIGN_TEST_ID"}`:
+
+```bash
+python -m secpo.crsecpo.preparation relations-export \
+  --training-export /path/to/training/master.tsv \
+  --evaluation-export /path/to/evaluation/master.tsv \
+  --candidates /path/to/relation-candidates.jsonl \
+  --output-dir outputs/crsecpo/relation-review
+python -m secpo.crsecpo.preparation relations-ingest \
+  --packet-dir outputs/crsecpo/relation-review \
+  --responses /path/to/completed-relations.jsonl --person-id teammate-a \
+  --output-dir outputs/crsecpo/audited-links
+```
+
+Only approved relations become `family_links.jsonl` or `matched_controls.jsonl`.
+Negative and unresolved decisions remain in `decisions.jsonl`; the report covers
+supplied candidates, not an exhaustive semantic search. Empty positive-link files
+are valid inputs to the splitter and do not establish reviewed matches.
+
+After human audits and near-duplicate review, prepare the experiment splits:
+
+```bash
+python -m secpo.crsecpo.records prepare \
+  --training-export /path/to/training/master.tsv \
+  --evaluation-export /path/to/evaluation/master.tsv \
+  --family-links /path/to/audited-family-links.jsonl \
+  --near-duplicate-review-complete \
+  --output-dir outputs/crsecpo/selected
+```
+
+A family-link row is `{"left":"RECORD_ID","right":"RECORD_ID","reason":"audited paraphrase"}`.
+The file can be empty **only after** near-duplicate review; normalized exact text
+matching does not establish semantic disjointness. Source and target exact matches
+plus audited links form connected components. Any training-origin record linked
+to a held-out family is quarantined. Other families split deterministically into
+training and validation. All input rows remain accounted for in the assignment
+manifest and quarantine file; original exports are never edited.
+
+An optional `--matched-controls` JSONL contains
+`{"harmful_id":"ID","benign_id":"ID","reason":"audited topic/style match"}`.
+Only accepted held-out harmful/benign members qualify. Matching is not inferred
+from publisher labels. Without audited matches the matched-control endpoint and
+joint success claim remain unavailable.
+
+### Generate one common preference file
+
+Use the official frozen Llama checkpoint, once per ordinary/combined answer and
+then in two fresh, order-swapped judging calls. Both votes must favor the combined
+answer **and** mark it acceptable. Ties, invalid/truncated responses, ordinary
+wins and disagreements remain in the outcomes file. No publisher completion is
+used as a preferred or rejected response.
+
+```bash
+python -m secpo.crsecpo.pairs outputs/crsecpo/selected/train.jsonl \
+  --model-id meta-llama/Llama-3.1-8B-Instruct \
+  --model-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
+  --tokenizer-id meta-llama/Llama-3.1-8B-Instruct \
+  --tokenizer-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
+  --device cuda --seed 42 --max-candidates 4096 \
+  --journal outputs/crsecpo/pair_requests.jsonl \
+  --outcomes outputs/crsecpo/pair_outcomes.jsonl \
+  --output outputs/crsecpo/all_pairs.jsonl
+```
+
+Generation uses locally cached weights. Every request includes prompt, rendered
+chat template, model/tokenizer revisions, decoding settings and seed in its cache
+identity. The journal appends and syncs each attempt. Resume with the same command;
+completed requests are replayed without resampling. Do not share a journal between
+simultaneous writers. An interrupted final journal write is recovered on resume:
+the complete original file is preserved in an `.interrupted-<hash>` backup,
+validated records are retained, and only an incomplete final record is retried.
+Corrupt complete records still stop the run for inspection.
+Final pair/outcome exports are atomic; if interrupted, the
+journal contains progress even before a final export exists. This is separate
+from the filtering reviewers' per-row database.
+
+Export a blinded human sample of accepted pairs, ordinary wins, ties and order
+disagreements after collection:
+
+```bash
+python -m secpo.crsecpo.preparation pair-audit-export \
+  --outcomes outputs/crsecpo/pair_outcomes.jsonl \
+  --rubric /path/to/frozen-answer-rubric.txt --per-stratum 10 --seed 42 \
+  --output-dir outputs/crsecpo/pair-audit
+```
+
+Give the reviewer only `human.jsonl` and `instructions.json`. The separate
+coordinator key retains answer origins and machine decisions. Use the same frozen
+answer rubric as generation and judging. Incomplete pairs are accounted for in
+the manifest; original outcomes remain intact. Complete a copy of the form
+manually; this export does not approve or change any training pair.
+
+`--max-candidates` is an explicit call-budget ceiling, not a promised pair yield
+or a dollar cap. The example permits at most 16,384 model calls. Candidate order
+is fixed by seed, interleaved by class, and cycled across families before seeing
+model outcomes. The collection manifest retains scheduled and deferred IDs;
+the request journal and outcome records establish which calls actually completed.
+The manifest also binds the outcomes and journal destinations. Changing either
+requires new export paths, preventing a resume from overwriting another experiment.
+Choose the ceiling from measured throughput and available GPU hours. Increasing
+it requires new export paths; the same request journal can reuse completed calls.
+Journals record elapsed time and generated token counts for cost estimates.
+
+Freeze a balanced common selection after generation:
+
+```bash
+python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
+  --freeze-pairs --data-file outputs/crsecpo/all_pairs.jsonl \
+  --output-dir outputs/crsecpo/frozen --pair-limit 2048
+```
+
+This loads only the tokenizer, verifies recorded generations and both judgments,
+checks every reference context's length, and selects equal harmful/benign counts
+up to the requested limit. It retains every input ID in `selection_audit.jsonl`,
+including invalid, overlong, and valid unselected pairs. All original collection
+files remain intact. It refuses an empty class or replacement of an existing
+selection. Scientific training requires this frozen file and its manifest.
+
+### Train and check the comparison
+
+```bash
+python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
+  --method crsecpo --data-file outputs/crsecpo/frozen/train_pairs.jsonl --prepare
+python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
+  --method sft --data-file outputs/crsecpo/frozen/train_pairs.jsonl
+python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
+  --method dpo --data-file outputs/crsecpo/frozen/train_pairs.jsonl
+python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
+  --method crsecpo --data-file outputs/crsecpo/frozen/train_pairs.jsonl
+```
+
+Each method defaults to a separate subdirectory. The one-GPU configuration uses
+effective batch size 64 (2 x 32), one epoch, learning rate 0.00016, rank 64 and
+beta 0.1. To keep that effective batch size fixed, the current experiment permits one training
+process and at most one visible GPU; multi-process or DataParallel execution is
+rejected before loading weights. Expose only the intended GPU when the host has
+several. `--prepare` loads only the tokenizer, checks data,
+and writes a manifest; it does not train. `--resume-from-checkpoint` verifies
+method, pair bytes/order, scientific configuration, and complete single-process
+Trainer/PEFT state (including optimizer, scheduler and RNG) before resuming. Test and
+validation rows cannot enter training. The shared configuration saves a full
+checkpoint every eight optimizer updates, including optimizer and RNG state,
+so the planned 32-update run has intermediate resume points.
+`--method rubric_only` is optional after
+core costs are measured; subscription filtering capacity is separate from GPU cost.
+Training pairs must use the same user-only deployment context as evaluation;
+custom system prompts are rejected by scientific training preparation.
+
+### Evaluate without loading every checkpoint together
+
+`configs/crsecpo_evaluation.json` is the frozen-base example. Create per-adapter
+copies adding `adapter_path` to the corresponding final output directory. Core
+adapter runs verify the training manifest and fingerprint the adapter contents.
+They require saved evidence that the declared training schedule completed. The
+joint comparison checks the same pair bytes/order, initialization, seed and
+training settings across all three arms, and the same base checkpoint for utility
+preservation. A partial checkpoint cannot silently enter the final comparison.
+The judge remains the frozen base. Evaluate one checkpoint per process:
+
+```bash
+python -m secpo.crsecpo.evaluation safety \
+  --config configs/crsecpo_evaluation.json --checkpoint base \
+  --input outputs/crsecpo/selected/test.jsonl --output-dir outputs/crsecpo/eval/base
+# Repeat with each adapter config and --checkpoint sft, dpo, or crsecpo.
+python -m secpo.crsecpo.evaluation freeze-gsm8k \
+  --input outputs/crsecpo/assets/gsm8k.jsonl \
+  --dataset-revision 3101c7d5072418e28b9008a6636bde82a006892c \
+  --output outputs/crsecpo/gsm8k_manifest.json
+```
+
+The `utility` command generates all 541 IFEval responses or the frozen 400 GSM8K
+responses. For IFEval, pass the pinned local Google Research checkout via
+`--official-repo`; the runner verifies the pinned checkout and writes the command
+for the original strict scorer. `score-ifeval` also requires `--official-repo` when
+importing its output. `score-gsm8k` loads the official local
+`grade_school_math/dataset.py` from
+[OpenAI's pinned revision](https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/dataset.py).
+Its required SHA256 is
+`c22b81bccaaebfd1123be296e8b3c3dca3ddc704c46b70bf4a50603bb627e197`;
+the loader and final comparison enforce it, rather than accepting any matching
+user-supplied checksum. Utility commands verify input bytes against
+`configs/crsecpo_inputs.json`; GSM8K commands also require the pinned dataset
+revision in selection manifests.
+No surrogate scoring rule is implemented. See each subcommand's `--help` for file arguments.
+
+`aggregate` joins the per-checkpoint safety directories only when their frozen
+data, rubric, grader template, judge, and decoding match. Utility score records
+retain generation/scorer provenance. It reports unsafe assistance, refusal,
+permitted help, direct/rewrite transitions and family-cluster uncertainty.
+Missing, truncated, or ambiguous judgments are never treated as safe. The joint
+decision uses conservative paired family bounds, which may be inconclusive at
+these sample sizes: even zero observed accuracy loss has an upper bound of about
+13.3 points for IFEval and 15.5 points for GSM8K, above the five-point tolerance.
+Review statistical power and freeze the intended estimator before scientific
+runs; a later estimator change must be recorded, not selected from test results.
+The current rule requires complete benchmark coverage, valid matched
+controls and explicit human-audit/independence attestations; it is not an automatic
+claim of retained utility. Report descriptive scores even when no joint claim is
+supported. Results remain conditional on the training seed.
+Completed model calls are durable in the generation and judgment journals;
+rerunning reconstructs derived results without repeating successful calls.
+
+Export up to 60 anonymous saved answers for the final human grading audit:
+
+```bash
+python -m secpo.crsecpo.preparation answer-audit-export \
+  --results outputs/crsecpo/eval/base/results.jsonl \
+  --results outputs/crsecpo/eval/crsecpo/results.jsonl \
+  --candidates outputs/crsecpo/selected/test.jsonl \
+  --rubric /path/to/frozen-answer-rubric.txt --limit 60 --seed 42 \
+  --output-dir outputs/crsecpo/answer-audit
+```
+
+Repeat `--results` for SFT, DPO and any other evaluated checkpoint. Forms show
+only the target, answer and blank human fields; the coordinator retains checkpoint
+identities and automatic grades. Give the reviewer only `human.jsonl` and
+`instructions.json`. Sampling is stratified and capped across all supplied
+checkpoints; sample counts are not population error estimates. Completed forms
+are manual evidence, not an automatic `--grading-audit-passed` attestation.
+
+Official utility scorers emit separate JSONL files. Assemble their records,
+without changing their provenance, into the object expected by
+`aggregate --utility-scores`:
+
+```python
+import json
+from pathlib import Path
+
+scores = {
+    suite: {
+        checkpoint: [json.loads(line) for line in
+            (Path("outputs/crsecpo/utility") / checkpoint / suite / "scores.jsonl")
+            .read_text().splitlines() if line.strip()]
+        for checkpoint in ("base", "crsecpo")
+    }
+    for suite in ("ifeval", "gsm8k")
+}
+with Path("outputs/crsecpo/utility_scores.json").open("x") as output:
+    json.dump(scores, output, indent=2)
+```
+
+The optional `released` comparator generates rewrites only, without the primary
+Llama checkpoint's direct-to-rewrite comparison.
+Its pinned configuration is `configs/crsecpo_released_evaluation.json`. Access to
+that gated checkpoint and its actual native chat template remain unverified;
+the runner rejects a missing template before loading weights rather than
+substituting an assumed format.
+
+### Requirements and verification boundaries
+
+| Requirement | Implementation and remaining verification |
+| --- | --- |
+| Keep all publisher data and all three independent reviews | Existing filtering store retains every row, vote, error and original field. Blinded fresh sessions hide peer decisions and publisher completions. This does not eliminate shared model biases. |
+| Unanimous accept/reject; disagreements remain unsure | Existing consensus rule is tested exhaustively; missing or invalid votes remain unreviewed. |
+| Resume without resubmitting provider-blocked content | Filtering coordinator automatically persists explicit provider safety refusals, including exact target duplicates, and continues unaffected rows. Saved logs recover holds before restart dispatch. Safety holds are never automatically retried, including at the end; unknown/account failures still stop dispatch. Holds never manufacture a vote or remove data. |
+| Human-audit and preparation tools | `preparation.py` supplies blinded two-person audit forms, separate findings and relation-review records; `assets --report-only` inventories host/assets without model inference. Human judgments and GPU-host measurements remain required. |
+| Disjoint families and appropriate matched controls | `records.py` groups exact normalized overlaps and applies audited links; semantic near-duplicate review and control matching still require human input. |
+| Correct preferred/rejected origins | `prompts.py` reconstructs each accepted pair from its four saved calls. Altered answers, contexts, or judgment outcomes fail validation. |
+| Same balanced data for SFT/DPO/CRSecPO | Common freeze validates every context, records exclusions, and binds the immutable file/order to training and evaluation manifests. |
+| Reuse SecPO's objective and training machinery | Original loss/trainer/loading helpers remain unchanged; default-preserving collation options support the new reference. Tiny real local model tests cover optimization and inference. |
+| Correct safety/helpfulness and utility measurements | Target-only grading reports harmful and partial-assistance outcomes separately; official utility scorers are bound to the prompts used for generation. |
+| Controlled final comparison | Evaluation checks completed training, pair/order/settings identities, benchmark coverage, and base-model identity before allowing a joint claim. |
+| Budget and actual model validity | Candidate call ceilings and timing/token journals support planning. GPU throughput, billing limits, full-model execution, and released-comparator access must be checked on the intended host. |
+| Scientific validity | Human audits, retained sample sizes and statistical power remain empirical requirements. Passing software tests cannot establish robustness or utility preservation. |
+
+### Verification and remaining empirical work
+
+Run `python -m pytest tests/test_crsecpo_*.py -q` for adapter tests and `python -m
+pytest -q` for the full release suite. Tests include an inert end-to-end record →
+pair → four scoring paths fixture and tiny random local Llama/PEFT optimizer and
+generation checks. They do not establish performance on Llama-3.1-8B or replace
+human data audits. The released full suite also contains Linux-only process tests;
+run those on the GPU host. Preserve any failures also present in the untouched
+upstream checkout instead of changing unrelated research machinery to hide them.
+
+Still required before scientific runs: finished filtering and human audits,
+audited family/control links, frozen training/test selections, model-host
+preflight, actual 8B throughput/cost measurements, and then the training and
+held-out runs. No cloud instance, paid inference, or full-model training is started
+by adding this scaffolding.
