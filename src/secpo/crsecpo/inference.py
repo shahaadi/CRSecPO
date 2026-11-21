@@ -385,15 +385,27 @@ class VLLMBackend:
             raise ValueError("model has no native completion terminator")
         self.context_limit = getattr(self.config, "max_position_embeddings", None)
         self.max_model_len = max_model_len
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")  # match local_files_only: never download
+        # Match local_files_only: hand vLLM the pinned local snapshot directories so
+        # it cannot download or resolve a different revision.
+        model_path = self._local_snapshot(spec.model_id, spec.model_revision)
+        tokenizer_path = self._local_snapshot(spec.tokenizer_id, spec.tokenizer_revision)
         from vllm import LLM
-        self.llm = LLM(model=spec.model_id, revision=spec.model_revision,
-                       tokenizer=spec.tokenizer_id, tokenizer_revision=spec.tokenizer_revision,
+        self.llm = LLM(model=model_path, tokenizer=tokenizer_path,
                        dtype=dtype, max_model_len=max_model_len, seed=0,
                        gpu_memory_utilization=gpu_memory_utilization, trust_remote_code=False,
                        # Never let vLLM merge generation_config.json defaults on its own;
                        # every sampling value is passed explicitly below.
                        generation_config="vllm")
+
+    @staticmethod
+    def _local_snapshot(identifier, revision):
+        if Path(identifier).is_dir():
+            return str(Path(identifier).resolve())
+        from huggingface_hub import snapshot_download
+        path = Path(snapshot_download(identifier, revision=revision, local_files_only=True))
+        if path.name != revision:
+            raise ValueError("local snapshot directory does not match the pinned revision")
+        return str(path)
 
     @staticmethod
     def _generation_config(spec):
@@ -408,7 +420,11 @@ class VLLMBackend:
         from transformers import GenerationConfig
         if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 1:
             raise ValueError("max_model_len must be a positive integer")
-        defaults = GenerationConfig._get_default_generation_params()
+        resolve = getattr(GenerationConfig, "_get_default_generation_params", None)
+        if resolve is None:
+            raise ValueError("this transformers version does not expose its generation defaults; "
+                             "cannot reproduce HFBackend sampling settings for vLLM")
+        defaults = resolve()
         return {"schema_version": VLLM_BACKEND_SCHEMA, "engine": "vllm", "engine_version": version("vllm"),
                 "dtype": dtype, "max_model_len": max_model_len,
                 "sampling_defaults": effective_hf_sampling(cls._generation_config(spec), defaults)}
