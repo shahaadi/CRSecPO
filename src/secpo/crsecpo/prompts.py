@@ -122,16 +122,21 @@ def validate_training_pair(row, tokenizer, model_id, model_revision, *,
     try:
         entries = [metadata["generations"][name] for name in ("ordinary", "combined")]
         entries += metadata["judgments"]
-        responses = {entry["request_id"]: entry["response"] for entry in entries
-                     if digest(entry["request"]) == entry["request_id"]}
-        if len(entries) != 4 or len(responses) != 4:
-            raise ValueError("pair needs four distinct, hash-verified recorded calls")
+        samples = [sample for entry in entries for sample in [*entry.get("prior_samples", ()), entry]]
+        responses = {sample["request_id"]: sample["response"] for sample in samples
+                     if digest(sample["request"]) == sample["request_id"]}
+        if len(entries) != 4 or len(responses) != len(samples):
+            raise ValueError("pair needs four distinct, hash-verified recorded calls and valid retry provenance")
+        observed_retries = max(len(entry.get("prior_samples", ())) for entry in entries)
         rebuilt, _ = generate_pairs([row], backend=lambda request: responses[digest(request)],
             tokenizer=tokenizer, model_spec=ModelSpec(**model), seed=metadata["seed"],
             generation_config=GenerationConfig(**metadata["generation_config"]),
             judge_config=GenerationConfig(**metadata["judge_config"]),
             deployment_system=metadata.get("deployment_system", ""),
-            backend_identity=metadata.get("backend_identity"))
+            backend_identity=metadata.get("backend_identity"),
+            output_retries=metadata.get("max_output_retries", observed_retries))
+        if rebuilt and "max_output_retries" not in metadata:
+            del rebuilt[0]["pair_metadata"]["max_output_retries"]
         if len(rebuilt) != 1 or any(row.get(key) != rebuilt[0][key] for key in
                 ("chosen", "rejected", "prompt", "clean_prompt", "rubric_prompt", "pair_metadata")):
             raise ValueError("pair differs from accepted recorded ordinary/combined calls")

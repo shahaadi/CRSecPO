@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,8 @@ import tempfile
 
 from secpo.evaluation.sep_adaptive import atomic_write_json
 from secpo.evaluation.sep_judge import atomic_write_jsonl, load_jsonl
+from .artifact_versions import logical_artifact_path
+from .collection_exports import read_collection_export
 from .prompts import answer_messages, digest
 from .records import GROUPS, POLICIES, eligible, normalized, read_review_export, sha256
 
@@ -337,11 +340,9 @@ def ingest_relations(packet_dir, response_path, output_dir, *, person_id):
 
 def _snapshot_rows(path):
     path = Path(path)
-    before = sha256(path)
-    rows = load_jsonl(path)
-    if sha256(path) != before:
-        raise ValueError("saved audit inputs changed while reading")
-    return rows, {"path": str(path.resolve()), "sha256": before}
+    payload = path.read_bytes()
+    return load_jsonl(path, payload=payload), {
+        "path": str(path.resolve()), "sha256": hashlib.sha256(payload).hexdigest()}
 
 
 def _publish_answer_audit(output_dir, records, *, kind, rubric, per_stratum, seed,
@@ -381,7 +382,12 @@ def _publish_answer_audit(output_dir, records, *, kind, rubric, per_stratum, see
 
 def export_pair_audit(output_dir, *, outcomes, rubric, per_stratum=10, seed=42):
     """Blind a stratified sample of saved accepted and skipped preference outcomes."""
-    rows, source = _snapshot_rows(outcomes)
+    from .pairs import _completion
+
+    path = Path(outcomes)
+    payload = read_collection_export(path, "outcomes")
+    rows = load_jsonl(path, payload=payload)
+    source = {"path": str(logical_artifact_path(path)), "sha256": hashlib.sha256(payload).hexdigest()}
     records, excluded, seen = [], [], set()
     for row in rows:
         record_id = row["id"]
@@ -401,7 +407,16 @@ def export_pair_audit(output_dir, *, outcomes, rubric, per_stratum=10, seed=42):
                 raise ValueError("pair generation request hash mismatch")
             if request.get("messages") != answer_messages(row, condition, deployment_system=system):
                 raise ValueError("pair outcome source/target differs from its recorded generation request")
+            if "error" in generation:
+                continue
             response = generation.get("response", {})
+            if "completion_terminator" in row:
+                try:
+                    _, answers[condition] = _completion(response, row["completion_terminator"])
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    pass
+                continue
+            # Older outcomes recorded completion errors but not the native terminator.
             answer = response.get("answer_text", response.get("text"))
             terminator = response.get("completion_terminator")
             if isinstance(answer, str) and isinstance(terminator, str) and terminator and answer.endswith(terminator):
@@ -442,7 +457,7 @@ def export_pair_audit(output_dir, *, outcomes, rubric, per_stratum=10, seed=42):
 def export_evaluation_audit(output_dir, *, results, candidates, rubric, per_stratum=10,
                             limit=60, seed=42):
     """Join saved results to frozen targets and export at most 60 anonymous answers."""
-    from .evaluation import _hash, validate_test_rows
+    from .evaluation import _hash, read_evaluation_results, validate_test_rows
     if type(limit) is not int or not 1 <= limit <= 60:
         raise ValueError("evaluation answer-audit limit must be between 1 and 60")
     candidates, source = _snapshot_rows(candidates)
@@ -452,8 +467,9 @@ def export_evaluation_audit(output_dir, *, results, candidates, rubric, per_stra
               if row["selection_group"] == "harmful_benign_framing"}
     records, seen, inputs = [], set(), {"candidates": source, "results": []}
     for path in results:
-        rows, source = _snapshot_rows(path)
-        inputs["results"].append(source)
+        rows, payload = read_evaluation_results(path)
+        inputs["results"].append({"path": str(logical_artifact_path(path)),
+                                  "sha256": hashlib.sha256(payload).hexdigest()})
         for row in rows:
             if (row.get("result_sha256") != _hash({key: value for key, value in row.items() if key != "result_sha256"})
                     or row["job_id"] in seen):

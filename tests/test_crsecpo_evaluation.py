@@ -357,6 +357,31 @@ def test_sequential_runs_aggregate_without_loading_models_and_reject_changed_dec
         aggregate_evaluations([tmp_path / "base", tmp_path / "sft"], tmp_path / "different", expected_candidates=rows)
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_aggregation_rejects_missing_evaluation_rows(tmp_path, legacy):
+    import shutil
+    from secpo.crsecpo import artifact_versions, evaluation
+
+    rows = [candidate()]
+    run = tmp_path / "run"
+    evaluation.run_evaluation(rows, {"base": Backend("base")}, Backend("judge", judge=True),
+                              run, rubric="frozen", generation_config=GenerationConfig())
+    result = run / "results.jsonl"
+    lines = result.read_bytes().splitlines(keepends=True)
+    assert len(lines) > 1
+    if legacy:
+        for path in (result, run / "summary.json"):
+            payload = path.read_bytes()
+            path.unlink()
+            path.write_bytes(payload)
+        shutil.rmtree(artifact_versions.version_root(result))
+    result.write_bytes(b"".join(lines[:-1]))
+    message = "exact planned job set" if legacy else "corrupt committed artifact version"
+    with pytest.raises(ValueError, match=message):
+        evaluation.aggregate_evaluations([run], tmp_path / "aggregate", expected_candidates=rows)
+    assert not (tmp_path / "aggregate" / "results.jsonl").exists()
+
+
 def test_utility_generation_uses_journals_adapter_identity_and_masks_truncation(tmp_path):
     from secpo.crsecpo.evaluation import run_utility_generation
     inputs = [{"item_id": str(i), "prompt": f"problem{i}"} for i in range(400)]
@@ -370,6 +395,140 @@ def test_utility_generation_uses_journals_adapter_identity_and_masks_truncation(
     assert len(backend.calls) == 400
     with pytest.raises(ValueError, match="protocol hash mismatch"):
         run_utility_generation(inputs, backend, tmp_path, suite="gsm8k", generation_config=GenerationConfig(temperature=0))
+
+
+def test_utility_does_not_publish_if_journal_disappears_while_staging(tmp_path, monkeypatch):
+    from secpo.crsecpo import evaluation
+
+    journal = tmp_path / "generation_requests.jsonl"
+    real_write = evaluation.atomic_write_jsonl
+
+    def remove_during_staging(rows, path, **kwargs):
+        journal.unlink()
+        real_write(rows, path, **kwargs)
+
+    monkeypatch.setattr(evaluation, "atomic_write_jsonl", remove_during_staging)
+    inputs = [{"item_id": str(i), "prompt": f"problem{i}"} for i in range(400)]
+    with pytest.raises(ValueError, match="journal changed after loading"):
+        evaluation.run_utility_generation(inputs, Backend(), tmp_path, suite="gsm8k",
+                                          generation_config=GenerationConfig())
+    assert not (tmp_path / "responses.jsonl").exists()
+
+
+def test_utility_and_safety_claim_the_same_protocol_lock(tmp_path, monkeypatch):
+    from secpo.crsecpo import evaluation
+
+    inputs = [{"item_id": str(i), "prompt": f"problem{i}"} for i in range(400)]
+    config = GenerationConfig()
+    real_write = evaluation._atomic_json
+
+    def try_safety_before_utility_claim(payload, path):
+        with pytest.raises(ValueError, match="another writer is using export lock"):
+            run_evaluation([candidate()], {"base": Backend()}, Backend(judge=True), tmp_path,
+                           rubric="frozen", generation_config=config)
+        real_write(payload, path)
+
+    monkeypatch.setattr(evaluation, "_atomic_json", try_safety_before_utility_claim)
+    rows = evaluation.run_utility_generation(inputs, Backend(), tmp_path, suite="gsm8k",
+                                             generation_config=config)
+    assert len(rows) == 400
+    assert json.loads((tmp_path / "protocol.json").read_text())["schema_version"] == "crsecpo-utility-generation-v1"
+
+
+def test_utility_rejects_protocol_change_in_publication(tmp_path, monkeypatch):
+    from secpo.crsecpo import evaluation
+
+    real_write = evaluation.atomic_write_jsonl
+
+    def replace_protocol_before_publish(rows, path, **kwargs):
+        (tmp_path / "protocol.json").write_text("{}")
+        real_write(rows, path, **kwargs)
+
+    monkeypatch.setattr(evaluation, "atomic_write_jsonl", replace_protocol_before_publish)
+    inputs = [{"item_id": str(i), "prompt": f"problem{i}"} for i in range(400)]
+    with pytest.raises(ValueError, match="protocol hash mismatch"):
+        evaluation.run_utility_generation(inputs, Backend(), tmp_path, suite="gsm8k",
+                                          generation_config=GenerationConfig())
+    assert not (tmp_path / "responses.jsonl").exists()
+
+
+@pytest.mark.parametrize("aggregate", [False, True])
+def test_interrupted_evaluation_refresh_preserves_artifact_set(tmp_path, monkeypatch, aggregate):
+    from secpo.crsecpo import artifact_versions, evaluation
+
+    result_path = tmp_path / "results.jsonl"
+    summary_path = tmp_path / "summary.json"
+    manifest_path = tmp_path / "aggregate_manifest.json"
+    original_manifest = {"generation": "first"} if aggregate else None
+    updated_manifest = {"generation": "second"} if aggregate else None
+    evaluation._publish_evaluation(tmp_path, [{"generation": "first"}], {"generation": "first"},
+                                   aggregate_manifest=original_manifest)
+    old = artifact_versions.committed_version(result_path)
+    pointer = artifact_versions.version_root(result_path) / "current"
+    real_replace = artifact_versions.os.replace
+
+    def stop_before_commit(source, destination):
+        if destination == pointer:
+            raise OSError("interrupted evaluation commit")
+        return real_replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(artifact_versions.os, "replace", stop_before_commit)
+        with pytest.raises(OSError, match="interrupted evaluation commit"):
+            evaluation._publish_evaluation(tmp_path, [{"generation": "second"}], {"generation": "second"},
+                                           aggregate_manifest=updated_manifest)
+
+    assert json.loads(result_path.read_text()) == json.loads(summary_path.read_text()) == {"generation": "first"}
+    if aggregate:
+        assert json.loads(manifest_path.read_text()) == original_manifest
+    assert artifact_versions.committed_version(result_path) == old
+
+    evaluation._publish_evaluation(tmp_path, [{"generation": "second"}], {"generation": "second"},
+                                   aggregate_manifest=updated_manifest)
+    assert json.loads(result_path.read_text()) == json.loads(summary_path.read_text()) == {"generation": "second"}
+    if aggregate:
+        assert json.loads(manifest_path.read_text()) == updated_manifest
+    assert json.loads((old / result_path.name).read_text()) == {"generation": "first"}
+
+
+def test_evaluation_and_collection_cannot_replace_each_others_versioned_paths(tmp_path):
+    from secpo.crsecpo import evaluation
+    from secpo.crsecpo.collection_exports import write_standalone_export
+    from secpo.crsecpo.inference import JournalBackend
+    from test_crsecpo_pairs import ScriptedBackend, collect
+
+    paths = {"output_path": tmp_path / "results.jsonl", "outcomes_path": tmp_path / "outcomes.jsonl"}
+    collect(ScriptedBackend(), **paths)
+    with pytest.raises(ValueError, match="run artifact path belongs to a collection"):
+        evaluation._publish_evaluation(tmp_path, [{"generation": "first"}], {"generation": "first"})
+
+    other = tmp_path / "other"
+    evaluation._publish_evaluation(other, [{"generation": "first"}], {"generation": "first"})
+    result_path = other / "results.jsonl"
+    with pytest.raises(ValueError, match="standalone export would overwrite"):
+        write_standalone_export([], result_path)
+    with pytest.raises(ValueError, match="journal path belongs to an export"):
+        JournalBackend(None, result_path)
+    assert json.loads(result_path.read_text()) == {"generation": "first"}
+
+
+def test_safety_evaluation_does_not_publish_after_judge_journal_disappears(tmp_path, monkeypatch):
+    from secpo.crsecpo import evaluation
+
+    journal = tmp_path / "judge_requests.jsonl"
+    real_write = evaluation.atomic_write_jsonl
+
+    def remove_during_staging(rows, path, **kwargs):
+        journal.unlink()
+        real_write(rows, path, **kwargs)
+
+    monkeypatch.setattr(evaluation, "atomic_write_jsonl", remove_during_staging)
+    with pytest.raises(ValueError, match="journal changed after loading"):
+        evaluation.run_evaluation([candidate()], {"base": Backend("base")},
+                                  Backend("judge", judge=True), tmp_path, rubric="frozen",
+                                  generation_config=GenerationConfig())
+    assert not (tmp_path / "results.jsonl").exists()
+    assert not (tmp_path / "summary.json").exists()
 
 
 def test_single_checkpoint_cli_loads_shared_frozen_model_once(monkeypatch, tmp_path):
@@ -501,7 +660,9 @@ def test_utility_response_provenance_is_bound_to_generated_model_and_content(tmp
     assert len(responses) == 400 and provenance["model"] == backend.spec.to_dict()
     assert provenance["backend_identity"] is None and provenance["inputs_sha256"]
     result_path = tmp_path / "responses.jsonl"
-    result_path.write_text(result_path.read_text().replace('"response": "help"', '"response": "changed"', 1))
+    lines = result_path.read_text().splitlines()
+    lines[0] = json.dumps(dict(json.loads(lines[0]), response="changed"))
+    result_path.write_text("\n".join(lines) + "\n")
     with pytest.raises(ValueError, match="corrupt"):
         _load_utility_responses(result_path, suite="gsm8k")
 

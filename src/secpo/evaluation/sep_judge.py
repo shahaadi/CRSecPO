@@ -564,7 +564,7 @@ def load_vote_cache(
     if not source.exists():
         return {}
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        lines = source.read_text(encoding="utf-8").split("\n")
     except (OSError, UnicodeError) as error:
         raise ValueError(f"could not read vote cache {source}: {error}") from error
     nonempty = [index for index, line in enumerate(lines) if line.strip()]
@@ -732,12 +732,13 @@ def evaluate_rows(
     return results
 
 
-def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
+def load_jsonl(path: str | Path, *, payload: bytes | None = None) -> list[dict[str, Any]]:
     """Read strict UTF-8 JSONL containing one object per non-empty line."""
 
     source = Path(path)
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        content = source.read_bytes() if payload is None else payload
+        lines = content.decode("utf-8").split("\n")
     except (OSError, UnicodeError) as error:
         raise ValueError(f"could not read input JSONL {source}: {error}") from error
     rows: list[dict[str, Any]] = []
@@ -758,7 +759,8 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def atomic_write_jsonl(rows: Iterable[Mapping[str, Any]], path: str | Path) -> None:
+def atomic_write_jsonl(rows: Iterable[Mapping[str, Any]], path: str | Path, *,
+                       before_replace: Callable[[], None] | None = None) -> None:
     """Atomically write deterministic UTF-8 JSONL."""
 
     destination = Path(path)
@@ -779,6 +781,8 @@ def atomic_write_jsonl(rows: Iterable[Mapping[str, Any]], path: str | Path) -> N
                 handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_replace is not None:
+            before_replace()
         os.replace(temporary_name, destination)
         temporary_name = None
     finally:

@@ -10,12 +10,20 @@ from collections import Counter
 from dataclasses import asdict, replace
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping, Sequence
+
+from secpo.evaluation.sep_adaptive import atomic_write_json
 
 from ..data import BenignReferenceCollator, PreferenceSchemaError, _read_json_records
 
+from .artifact_versions import logical_artifact_path
+from .collection_exports import read_collection_export
+
 METHODS = ("sft", "dpo", "crsecpo", "rubric_only")
+COLLECTION_FIELDS = ("backend_identity", "generation_config", "judge_config")
 
 
 class ComparisonCollator(BenignReferenceCollator):
@@ -97,6 +105,12 @@ def _validate_training_row(row, config, tokenizer, collator):
         raise PreferenceSchemaError(f"{row_id}: {error}") from error
 
 
+def _pair_retry_limit(metadata):
+    # Legacy HF collection never retried model outputs. Legacy vLLM files
+    # could come from either policy; absence of retries is not evidence of a limit.
+    return metadata.get("max_output_retries", 0 if metadata.get("backend_identity") is None else None)
+
+
 def prepare(config: Any, method: str, *, tokenizer: Any, require_selection: bool = False) -> tuple[list[dict], ComparisonCollator, dict]:
     """Validate every row/context, preserving input order across all methods.
 
@@ -111,8 +125,8 @@ def prepare(config: Any, method: str, *, tokenizer: Any, require_selection: bool
     if not config.append_eos:
         raise ValueError("CRSecPO comparisons require append_eos=true for native termination")
     path = Path(config.data_file).expanduser()
-    payload = path.read_bytes()
-    rows = _read_json_records(path)
+    payload = read_collection_export(path, "pairs")
+    rows = _read_json_records(path, payload=payload)
     if not rows:
         raise PreferenceSchemaError("training pair file is empty")
     seen = set()
@@ -137,17 +151,22 @@ def prepare(config: Any, method: str, *, tokenizer: Any, require_selection: bool
     if selection_path.exists():
         selection = json.loads(selection_path.read_text())
         counts = Counter("harmful" if row["selection_group"] == "harmful_benign_framing" else "benign" for row in rows)
+        recorded_settings = {field: selection[field] for field in COLLECTION_FIELDS if field in selection}
         if (selection.get("schema_version") != "crsecpo-selection-v1"
                 or selection.get("output_sha256") != hashlib.sha256(payload).hexdigest()
                 or selection.get("ordered_ids") != [row["id"] for row in rows]
                 or selection.get("selected_counts") != dict(counts)
+                or any(row["pair_metadata"].get(field) != value
+                       for row in rows for field, value in recorded_settings.items())
+                or ("max_output_retries" in selection and any(
+                    _pair_retry_limit(row["pair_metadata"]) != selection["max_output_retries"] for row in rows))
                 or counts["harmful"] != counts["benign"] or not counts["harmful"]):
             raise PreferenceSchemaError("frozen common selection manifest does not match balanced pair file")
     elif require_selection:
         raise PreferenceSchemaError("scientific training requires --freeze-pairs output and selection_manifest.json")
     manifest = {
         "schema_version": "crsecpo-training-manifest-v1", "method": method,
-        "input_path": str(path.resolve()), "input_sha256": hashlib.sha256(payload).hexdigest(),
+        "input_path": str(logical_artifact_path(path)), "input_sha256": hashlib.sha256(payload).hexdigest(),
         "ordered_ids": [row["id"] for row in rows], "rows": len(rows),
         "source_sha256_counts": dict(Counter(hashlib.sha256(row["source"].encode()).hexdigest() for row in rows)),
         "selection_group_counts": dict(Counter(row["selection_group"] for row in rows)),
@@ -167,9 +186,13 @@ def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
     from secpo.evaluation.sep_judge import atomic_write_jsonl
     if type(pair_limit) is not int or pair_limit < 2 or pair_limit % 2:
         raise ValueError("pair_limit must be a positive even number")
+    out = Path(output_dir).expanduser()
+    if out.exists() or out.is_symlink():
+        raise FileExistsError(f"Frozen selection already exists: {out}")
     source = Path(config.data_file).expanduser()
-    input_hash = sha256(source)
-    rows = _read_json_records(source)
+    payload = read_collection_export(source, "pairs")
+    input_hash = hashlib.sha256(payload).hexdigest()
+    rows = _read_json_records(source, payload=payload)
     collator = ComparisonCollator(tokenizer, config.max_length, method="crsecpo",
                                   max_prompt_length=config.max_prompt_length)
     eligible, audit, seen = [], [], set()
@@ -192,26 +215,45 @@ def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
     per_class = min(pair_limit // 2, *(len(values) for values in classes.values()))
     if per_class == 0:
         raise PreferenceSchemaError("no balanced common selection: both classes need usable pairs")
+    metadata = eligible[0]["pair_metadata"]
+    collection_settings = {field: metadata.get(field) for field in COLLECTION_FIELDS}
+    for field, value in collection_settings.items():
+        if any(row["pair_metadata"].get(field) != value for row in eligible):
+            label = "collection backend identities" if field == "backend_identity" else field
+            raise PreferenceSchemaError(f"eligible pairs use different {label}")
+    retry_limits = {_pair_retry_limit(row["pair_metadata"]) for row in eligible}
+    if None in retry_limits:
+        raise PreferenceSchemaError("eligible vLLM pairs lack a recorded retry limit; re-export from their collection journal")
+    if len(retry_limits) != 1:
+        raise PreferenceSchemaError("eligible pairs use different max_output_retries")
+    collection_settings["max_output_retries"] = retry_limits.pop()
     selected = [row for pair in zip(classes["harmful"][:per_class], classes["benign"][:per_class]) for row in pair]
     selected_ids = {row["id"] for row in selected}
     for entry in audit:
         if entry["id"] in selected_ids:
             entry["status"] = "selected"
-    if sha256(source) != input_hash:
+    if hashlib.sha256(read_collection_export(source, "pairs")).hexdigest() != input_hash:
         raise ValueError("input pair file changed while freezing the common selection")
-    out = Path(output_dir).expanduser()
-    out.mkdir(parents=True, exist_ok=False)
-    output = out / "train_pairs.jsonl"
-    atomic_write_jsonl(selected, output)
-    atomic_write_jsonl(audit, out / "selection_audit.jsonl")
-    manifest = {"schema_version": "crsecpo-selection-v1", "input_sha256": input_hash,
-        "input_pairs": len(rows), "pair_limit": pair_limit, "seed": config.seed,
-        "max_length": config.max_length, "max_prompt_length": config.max_prompt_length,
-        "eligible_counts": {name: len(values) for name, values in classes.items()},
-        "selected_counts": {name: per_class for name in classes},
-        "ordered_ids": [row["id"] for row in selected], "output_sha256": sha256(output),
-        "audit_sha256": sha256(out / "selection_audit.jsonl")}
-    _write_manifest_once(out / "selection_manifest.json", manifest)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=out.parent, prefix=f".{out.name}.") as temporary:
+        staged = Path(temporary) / "selection"
+        output = staged / "train_pairs.jsonl"
+        audit_path = staged / "selection_audit.jsonl"
+        atomic_write_jsonl(selected, output)
+        atomic_write_jsonl(audit, audit_path)
+        manifest = {"schema_version": "crsecpo-selection-v1", "input_sha256": input_hash,
+            "input_pairs": len(rows), "pair_limit": pair_limit, "seed": config.seed,
+            "max_length": config.max_length, "max_prompt_length": config.max_prompt_length,
+            **collection_settings,
+            "eligible_counts": {name: len(values) for name, values in classes.items()},
+            "selected_counts": {name: per_class for name in classes},
+            "ordered_ids": [row["id"] for row in selected], "output_sha256": sha256(output),
+            "audit_sha256": sha256(audit_path)}
+        _write_manifest_once(staged / "selection_manifest.json", manifest)
+        # A competing freeze publishes a nonempty directory that rename cannot replace.
+        if out.exists() or out.is_symlink():
+            raise FileExistsError(f"Frozen selection already exists: {out}")
+        staged.rename(out)
     return manifest
 
 
@@ -267,11 +309,16 @@ def guard_output(config: Any, manifest: dict, *, resume_from_checkpoint: str | N
         if _run_identity(existing) != _run_identity(manifest):
             raise ValueError(f"Training manifest differs in method, pairs, or settings: {path}")
 
-    if canonical.exists():
+    artifacts = output.exists() and any(
+        path != canonical and not (
+            path.name.startswith(_manifest_stage_prefix(canonical)) and path.is_dir() and not path.is_symlink()
+        )
+        for path in output.iterdir()
+    )
+    if canonical.exists() or canonical.is_symlink():
         check(canonical)
-    elif output.exists() and any(output.iterdir()):
+    elif artifacts:
         raise ValueError(f"Output directory contains unrelated files without a training manifest: {output}")
-    artifacts = output.exists() and any(path != canonical for path in output.iterdir())
     if artifacts and not prepare_only and resume_from_checkpoint is None:
         raise ValueError("Output contains training artifacts; choose a new directory or explicitly resume")
     if resume_from_checkpoint is not None:
@@ -300,17 +347,25 @@ def guard_output(config: Any, manifest: dict, *, resume_from_checkpoint: str | N
     return canonical
 
 
+def _manifest_stage_prefix(destination: Path) -> str:
+    return f".{destination.name}.stage-"
+
+
 def _write_manifest_once(destination: Path, manifest: dict) -> None:
-    """Preserve existing manifests; never replace provenance during a resume."""
+    """Atomically publish provenance without replacing an existing manifest."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with destination.open("x", encoding="utf-8") as handle:
-            json.dump(manifest, handle, indent=2)
-            handle.write("\n")
-    except FileExistsError:
-        existing = json.loads(destination.read_text(encoding="utf-8"))
-        if _run_identity(existing) != _run_identity(manifest):
-            raise ValueError(f"Refusing to overwrite a different manifest: {destination}")
+    if not destination.exists() and not destination.is_symlink():
+        with tempfile.TemporaryDirectory(dir=destination.parent,
+                                         prefix=_manifest_stage_prefix(destination)) as temporary:
+            staged = Path(temporary) / destination.name
+            atomic_write_json(staged, manifest)
+            try:
+                os.link(staged, destination)
+            except FileExistsError:
+                pass  # Check the complete manifest published by the other writer.
+    existing = json.loads(destination.read_text(encoding="utf-8"))
+    if _run_identity(existing) != _run_identity(manifest):
+        raise ValueError(f"Refusing to overwrite a different manifest: {destination}")
 
 
 def main(argv: Sequence[str] | None = None) -> None:

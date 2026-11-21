@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict
 import hashlib
 import importlib.util
@@ -25,8 +26,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from secpo.evaluation.sep_static import load_json_records, write_jsonl
-from secpo.evaluation.sep_judge import atomic_write_jsonl
+from secpo.evaluation.sep_judge import atomic_write_jsonl, load_jsonl
 from secpo.evaluation.sep_adaptive import atomic_write_json
+from .artifact_versions import logical_artifact_path, publish_version, read_version_file
+from .collection_exports import lock_data_paths, validate_run_artifact_destination
 from .pairs import validate_candidate
 from .prompts import RUBRIC, data_message
 
@@ -126,6 +129,38 @@ def _request(backend: Any, messages: Sequence[Mapping[str, str]], config: Any,
                         backend_identity=getattr(backend, "fingerprint", None))
 
 
+def _evaluation_jobs(candidates, label):
+    direct_seen = set()
+    for row in candidates:
+        if label != "released" and row["selection_group"] == HARMFUL_GROUP:
+            source_id = _hash(row["source"])
+            if source_id not in direct_seen:
+                direct_seen.add(source_id)
+                yield "direct", row["source"], {**row, "item_id": source_id}
+        yield "framed", row["target"], {**row, "item_id": row["id"]}
+
+
+def _verify_protocol_snapshot(path, protocol):
+    if json.loads(path.read_text(encoding="utf-8")) != protocol:
+        raise ValueError("resume protocol hash mismatch; use a fresh output directory")
+
+
+def _claim_evaluation_protocol(destination, protocol, *additional_artifacts):
+    protocol_path = destination / "protocol.json"
+    artifacts = (destination / "results.jsonl", protocol_path, *additional_artifacts)
+    with lock_data_paths(*artifacts):
+        for path in artifacts:
+            validate_run_artifact_destination(path)
+        aggregate_path = destination / "aggregate_manifest.json"
+        if aggregate_path.exists() or aggregate_path.is_symlink():
+            raise ValueError("evaluation output directory belongs to an aggregate")
+        if protocol_path.exists():
+            _verify_protocol_snapshot(protocol_path, protocol)
+        else:
+            _atomic_json(protocol, protocol_path)
+    return protocol_path
+
+
 def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, Any],
                    judge_backend: Any, output_dir: str | Path, *, rubric: str,
                    generation_config: Any, judge_config: Any | None = None,
@@ -142,7 +177,7 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
     if not checkpoints or not isinstance(rubric, str) or not rubric.strip():
         raise ValueError("checkpoints and a frozen nonempty rubric are required")
     judge_config = judge_config or generation_config
-    destination = Path(output_dir)
+    destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     protocol = {
         "schema_version": SCHEMA_VERSION, "candidates_sha256": _hash(candidates),
@@ -155,27 +190,14 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
                   "backend_identity": getattr(judge_backend, "fingerprint", None)},
     }
     protocol["protocol_sha256"] = _hash(protocol)
-    protocol_path = destination / "protocol.json"
-    if protocol_path.exists():
-        if json.loads(protocol_path.read_text()) != protocol:
-            raise ValueError("resume protocol hash mismatch; use a fresh output directory")
-    else:
-        _atomic_json(protocol, protocol_path)
-    result_path = destination / "results.jsonl"
+    protocol_path = _claim_evaluation_protocol(destination, protocol)
     results = []
     judge = JournalBackend(judge_backend, destination / "judge_requests.jsonl")
+    journals = [judge]
     for label, backend in checkpoints.items():
         generator = JournalBackend(backend, destination / ("generation_" + _hash(label)[:16] + ".jsonl"))
-        jobs: list[tuple[str, str, dict[str, Any]]] = []
-        direct_seen: set[str] = set()
-        for row in candidates:
-            if label != "released" and row["selection_group"] == HARMFUL_GROUP:
-                source_id = _hash(row["source"])
-                if source_id not in direct_seen:
-                    direct_seen.add(source_id)
-                    jobs.append(("direct", row["source"], {**row, "item_id": source_id}))
-            jobs.append(("framed", row["target"], {**row, "item_id": row["id"]}))
-        for kind, target, row in jobs:
+        journals.append(generator)
+        for kind, target, row in _evaluation_jobs(candidates, label):
             job_id = _hash([label, kind, row["item_id"]])
             generation_request = _request(backend, [{"role": "user", "content": target}],
                                           generation_config, seed, "evaluation_" + kind)
@@ -204,10 +226,68 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
             }
             result["result_sha256"] = _hash(result)
             results.append(result)
-    atomic_write_jsonl(results, result_path)
     report = summarize_evaluation(results)
-    _atomic_json(report, destination / "summary.json")
+    with ExitStack() as snapshots:
+        checks = [snapshots.enter_context(journal.publication_snapshot()) for journal in journals]
+
+        def verify_sources():
+            _verify_protocol_snapshot(protocol_path, protocol)
+            for check in checks:
+                check()
+
+        _publish_evaluation(destination, results, report, verify_source=verify_sources)
     return report
+
+
+def _publish_evaluation(destination, results, summary, *, aggregate_manifest=None, verify_source=None):
+    destination = destination.resolve()
+    result_path = destination / "results.jsonl"
+    summary_path = destination / "summary.json"
+    views = {result_path: result_path.name, summary_path: summary_path.name}
+    if aggregate_manifest is not None:
+        manifest_path = destination / "aggregate_manifest.json"
+        views[manifest_path] = manifest_path.name
+
+    def write_files(stage):
+        atomic_write_jsonl(results, stage / result_path.name)
+        _atomic_json(summary, stage / summary_path.name)
+        if aggregate_manifest is not None:
+            _atomic_json(aggregate_manifest, stage / manifest_path.name)
+
+    def verify_legacy(stage):
+        old_report = json.loads((stage / summary_path.name).read_text(encoding="utf-8"))
+        old_results = load_jsonl(stage / result_path.name)
+        if any(not _valid_result_hash(row) for row in old_results):
+            raise ValueError("legacy evaluation contains corrupt results")
+        expected = summarize_evaluation(old_results)
+        keys = expected.keys() - ({"joint_claim"} if aggregate_manifest is not None else set())
+        if any(old_report.get(key) != expected[key] for key in keys):
+            raise ValueError("legacy evaluation results and summary do not match")
+        if aggregate_manifest is not None:
+            json.loads((stage / manifest_path.name).read_text(encoding="utf-8"))
+
+    with lock_data_paths(*views):
+        for path in views:
+            validate_run_artifact_destination(path)
+        if aggregate_manifest is not None and (destination / "protocol.json").exists():
+            raise ValueError("aggregate output directory belongs to an individual evaluation")
+        publish_version(result_path, views, write_files, legacy=verify_legacy, verify_source=verify_source)
+
+
+def read_evaluation_results(path):
+    """Return the exact verified JSONL payload and its parsed result rows."""
+    path = logical_artifact_path(path)
+    members = ["results.jsonl", "summary.json"]
+    if (path.parent / "aggregate_manifest.json").is_symlink():
+        members.append("aggregate_manifest.json")
+    payload = read_version_file(path, path.name, members)
+    if payload is None:
+        payload = path.read_bytes()
+    return load_jsonl(path, payload=payload), payload
+
+
+def _valid_result_hash(row):
+    return row.get("result_sha256") == _hash({key: value for key, value in row.items() if key != "result_sha256"})
 
 
 def _rate(values: Sequence[Any]) -> dict[str, Any]:
@@ -691,14 +771,20 @@ def aggregate_evaluations(run_dirs: Sequence[str | Path], output_dir: str | Path
         if checkpoints & names:
             raise ValueError("duplicate checkpoint across evaluation runs")
         checkpoints.update(names)
-        rows = load_json_records(path / "results.jsonl")
+        rows, _ = read_evaluation_results(path / "results.jsonl")
         ids: set[str] = set()
         for row in rows:
-            if row.get("result_sha256") != _hash({key: value for key, value in row.items() if key != "result_sha256"}):
+            if not _valid_result_hash(row):
                 raise ValueError("corrupt result journal hash")
             if row.get("protocol_sha256") != protocol["protocol_sha256"] or row["checkpoint"] not in names or row["job_id"] in ids:
                 raise ValueError("invalid aggregate result identity")
+            if row["job_id"] != _hash([row["checkpoint"], row["kind"], row["item_id"]]):
+                raise ValueError("aggregate result job identifier does not match its row")
             ids.add(row["job_id"])
+        expected_ids = {_hash([label, kind, row["item_id"]])
+                        for label in names for kind, _, row in _evaluation_jobs(candidates, label)}
+        if ids != expected_ids:
+            raise ValueError("evaluation results do not contain the exact planned job set")
         merged.extend(rows)
     if not run_dirs:
         raise ValueError("at least one completed evaluation directory is required")
@@ -709,11 +795,11 @@ def aggregate_evaluations(run_dirs: Sequence[str | Path], output_dir: str | Path
     summary["joint_claim"] = summary["decision"]["joint_claim"]
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    write_jsonl(merged, out / "results.jsonl")
-    _atomic_json(summary, out / "summary.json")
-    _atomic_json({"schema_version": SCHEMA_VERSION, "common_protocol": reference,
-                  "run_dirs": [str(Path(path).resolve()) for path in run_dirs],
-                  "checkpoints": sorted(checkpoints)}, out / "aggregate_manifest.json")
+    _publish_evaluation(out, merged, summary, aggregate_manifest={
+        "schema_version": SCHEMA_VERSION, "common_protocol": reference,
+        "run_dirs": [str(Path(path).resolve()) for path in run_dirs],
+        "checkpoints": sorted(checkpoints),
+    })
     return summary
 
 
@@ -733,17 +819,15 @@ def run_utility_generation(inputs: Sequence[Mapping[str, Any]], backend: Any,
     if len({row["item_id"] for row in inputs}) != len(inputs) or any(
         not isinstance(row["item_id"], str) or not isinstance(row["prompt"], str) or not row["prompt"] for row in inputs):
         raise ValueError("utility inputs require unique string item IDs and nonempty prompts")
-    destination = Path(output_dir)
+    destination = Path(output_dir).resolve()
     destination.mkdir(parents=True, exist_ok=True)
     protocol = {"schema_version": "crsecpo-utility-generation-v1", "suite": suite,
                 "inputs_sha256": _hash(list(inputs)), "model": asdict(backend.spec),
                 "backend_identity": getattr(backend, "fingerprint", None),
                 "generation_config": asdict(generation_config), "seed": seed}
     protocol["protocol_sha256"] = _hash(protocol)
-    protocol_path = destination / "protocol.json"
-    if protocol_path.exists() and json.loads(protocol_path.read_text()) != protocol:
-        raise ValueError("utility resume protocol hash mismatch")
-    _atomic_json(protocol, protocol_path)
+    responses_path = destination / "responses.jsonl"
+    protocol_path = _claim_evaluation_protocol(destination, protocol, responses_path)
     generator = JournalBackend(backend, destination / "generation_requests.jsonl")
     results = []
     for row in inputs:
@@ -758,7 +842,14 @@ def run_utility_generation(inputs: Sequence[Mapping[str, Any]], backend: Any,
                         "protocol_sha256": protocol["protocol_sha256"]}
         result["result_sha256"] = _hash(result)
         results.append(result)
-    write_jsonl(results, destination / "responses.jsonl")
+    with generator.publication_snapshot() as verify_source:
+        def verify_sources():
+            _verify_protocol_snapshot(protocol_path, protocol)
+            verify_source()
+
+        with lock_data_paths(responses_path, protocol_path):
+            validate_run_artifact_destination(responses_path)
+            atomic_write_jsonl(results, responses_path, before_replace=verify_sources)
     return results
 
 

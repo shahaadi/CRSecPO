@@ -5,6 +5,9 @@ returning a dictionary with ``text`` and ``finish_reason`` (stop or length).
 No provider SDK, credential, download, or API billing is involved.
 """
 from __future__ import annotations
+from contextlib import contextmanager, ExitStack
+from copy import deepcopy
+import fcntl
 from dataclasses import asdict, dataclass
 import hashlib
 import json
@@ -16,7 +19,12 @@ import time
 from typing import Any, Callable, Mapping
 
 from secpo.evaluation.sep_judge import atomic_write_jsonl, load_jsonl
+from .artifact_versions import logical_artifact_path
+from .collection_exports import (claim_journal_destination, is_claimed_journal, lock_data_paths,
+                                 validate_data_path, validate_journal_destination)
 from .prompts import digest
+
+MAX_BATCH_SUBMISSIONS = 32
 
 
 @dataclass(frozen=True)
@@ -82,9 +90,59 @@ def validate_response(value):
         raise ValueError("backend response must contain string text")
     if value.get("finish_reason") not in {"stop", "length"}:
         raise ValueError("backend must report finish_reason stop or length")
-    # Ensure the entire response is persistable, including backend provenance.
-    json.dumps(dict(value), allow_nan=False)
-    return dict(value)
+    response = dict(value)
+    # Match the journal's UTF-8 serialization before accepting the response.
+    try:
+        json.dumps(response, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("backend response contains invalid Unicode") from error
+    return response
+
+
+def format_error(error: Exception) -> str:
+    message = f"{type(error).__name__}: {error}"
+    return message.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+class BatchEngineUnavailable(RuntimeError):
+    """The inference engine must be restarted before collection resumes."""
+
+
+class JournalStateError(ValueError):
+    """A journal storage or consistency failure that must stop publication."""
+
+
+_JOURNAL_FIELDS = ("attempt", "batch_size", "elapsed_seconds", "error",
+                   "request", "request_id", "response", "status")
+
+
+def _journal_tail_is_torn(tail, error, *, known_journal):
+    # An ambiguous first fragment in an unmarked file cannot establish
+    # ownership. Current writers claim the path before writing the first byte.
+    if not known_journal:
+        return False
+    text = tail.lstrip(b" \t\r")
+    header = re.match(rb'\{[ \t\r]*"([a-z_]+)"[ \t\r]*:', text)
+    if header is not None:
+        if header[1].decode("ascii") not in _JOURNAL_FIELDS:
+            return False
+    elif not any(
+        (f'{{"{field}":').encode().startswith(text) for field in _JOURNAL_FIELDS
+    ):
+        return False
+
+    if isinstance(error, UnicodeDecodeError):
+        return error.end == len(tail) and error.reason == "unexpected end of data"
+    remaining = error.doc[error.pos:].strip()
+    if not remaining or error.msg.startswith("Unterminated string"):
+        return True
+    if error.msg == r"Invalid \uXXXX escape":
+        return bool(re.fullmatch(r"u[0-9a-fA-F]{0,3}", remaining))
+    if error.msg == "Expecting value":
+        return any(literal.startswith(remaining) for literal in ("true", "false", "null", "-"))
+    if error.msg == "Expecting ',' delimiter":
+        return bool(re.fullmatch(r"(?:[eE][+-]?|\.)", remaining))
+    return False
 
 
 class JournalBackend:
@@ -94,75 +152,190 @@ class JournalBackend:
     revision and seed. Every retry remains in the audit log. This is a single-
     writer journal: do not share one path between concurrent processes.
     """
-    def __init__(self, backend: Callable, path: str | Path):
-        self.backend, self.path = backend, Path(path)
+    def __init__(self, backend: Callable, path: str | Path, *, lock_replacement=None):
+        validate_data_path(path)
+        self.backend, self.path = backend, logical_artifact_path(path)
         self.entries = {}
         self.attempt_counts = {}
+        self._content_hash = hashlib.sha256()
+        # CLI collection holds this lock throughout startup, repair and writing.
+        self._external_lock = lock_replacement is not None
+        with self._path_lock() as (pin, _):
+            validate_journal_destination(self.path)
+            self._snapshot = self._file_snapshot()
+            self._load(lock_replacement or pin)
+            self._verify_snapshot()
+
+    @contextmanager
+    def _path_lock(self):
+        if self._external_lock:
+            yield None, True
+            return
+        with lock_data_paths(self.path), ExitStack() as inodes:
+            def pin(path):
+                handle = inodes.enter_context(path.open("r+b"))
+                try:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ValueError(f"another collector is using journal {self.path}") from error
+
+            try:
+                pin(self.path)
+            except FileNotFoundError:
+                yield pin, False
+            else:
+                yield pin, True
+
+    def _load(self, lock_replacement):
         if self.path.exists() and self.path.stat().st_size:
             original = self.path.read_bytes()
+            self._verify_snapshot()
+            self._content_hash.update(original)
             interrupted = not original.endswith(b"\n")
             if interrupted:
                 tail = original.rsplit(b"\n", 1)[-1]
                 try:
                     json.loads(tail.decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    recovered = original[:-len(tail)]
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    prefix = original[:-len(tail)]
+                    if not _journal_tail_is_torn(tail, error, known_journal=bool(prefix.strip())
+                                                or is_claimed_journal(self.path)):
+                        raise JournalStateError(f"unrecognized or corrupt final journal record: {self.path}") from error
+                    recovered = prefix
                 else:
                     # A complete final response must replay even if its newline
                     # was the only byte lost in the interrupted write.
                     recovered = original + b"\n"
-                with tempfile.NamedTemporaryFile(dir=self.path.parent) as staged:
-                    staged.write(recovered)
-                    staged.flush()
-                    rows = load_jsonl(staged.name) if recovered.strip() else []
+                rows = load_jsonl(self.path, payload=recovered) if recovered.strip() else []
             else:
-                rows = load_jsonl(self.path)
+                rows = load_jsonl(self.path, payload=original)
             for row in rows:
+                if not isinstance(row.get("request"), dict):
+                    raise ValueError(f"journal {self.path} has an attempt without a request object")
                 request_id = digest(row["request"])
                 if request_id != row.get("request_id"):
                     raise ValueError("journal request hash mismatch")
                 if row.get("status") not in {"ok", "error"}:
                     raise ValueError("journal contains unknown attempt status")
                 if row.get("status") == "ok":
-                    validate_response(row["response"])
+                    validate_response(row.get("response"))
                 next_attempt = self.attempt_counts.get(request_id, 0) + 1
                 if row.get("attempt", next_attempt) != next_attempt:
                     raise ValueError("journal attempt sequence is corrupt")
-                self.attempt_counts[request_id] = next_attempt
-                # A completed successful sample is immutable, even if a later
-                # audit row records an error for that request.
-                if row["status"] == "ok" or self.entries.get(request_id, {}).get("status") != "ok":
-                    self.entries[request_id] = row
+                self._remember(row, next_attempt)
             if interrupted:
-                # Validate the entire retained prefix before changing anything.
-                # A hard link preserves every original byte across replacement,
-                # including a partial UTF-8 character or unfinished JSON object.
-                backup = self.path.with_name(self.path.name + ".interrupted-" +
-                                             hashlib.sha256(original).hexdigest())
-                try:
-                    os.link(self.path, backup)
-                except FileExistsError:
-                    if backup.read_bytes() != original:
-                        raise ValueError("interrupted journal backup differs from original")
-                atomic_write_jsonl(rows, self.path)
+                claim_journal_destination(self.path)
+                # Preserve the bytes that were validated, independent of the
+                # source inode or any aliases that still point at it.
+                backup = self.path.with_name(self.path.name + ".interrupted-" + self._content_hash.hexdigest())
+                with tempfile.TemporaryDirectory(dir=self.path.parent) as temporary:
+                    staged = Path(temporary) / "repaired.jsonl"
+                    atomic_write_jsonl(rows, staged)
+                    lock_replacement(staged)
+                    snapshot = self._snapshot_from_stat(staged.stat())
+                    content_hash = hashlib.sha256(staged.read_bytes())
+                    self._verify_content()
+                    staged_backup = Path(temporary) / "backup"
+                    with staged_backup.open("wb") as handle:
+                        handle.write(original)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    try:
+                        os.link(staged_backup, backup)
+                    except FileExistsError:
+                        if backup.read_bytes() != original:
+                            raise ValueError("interrupted journal backup differs from original")
+                    self._verify_content()
+                    os.replace(staged, self.path)
+                    self._snapshot = snapshot
+                    self._content_hash = content_hash
+
+    def _file_snapshot(self):
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return self._snapshot_from_stat(stat)
+
+    @staticmethod
+    def _snapshot_from_stat(stat):
+        if stat.st_size:
+            return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+        return None
+
+    def _verify_snapshot(self):
+        try:
+            current = self._file_snapshot()
+        except OSError as error:
+            raise JournalStateError(f"cannot inspect journal {self.path}: {error}") from error
+        if current != self._snapshot:
+            raise JournalStateError(f"journal changed after loading; reopen it before continuing: {self.path}")
+
+    @contextmanager
+    def publication_snapshot(self):
+        """Keep the journal stable while publishing artifacts derived from it."""
+        with self._path_lock():
+            self._verify_content()
+            yield self._verify_content
+
+    def _verify_content(self):
+        self._verify_snapshot()
+        try:
+            with self.path.open("rb") as handle:
+                actual = hashlib.file_digest(handle, "sha256").digest()
+        except FileNotFoundError as error:
+            if self._snapshot is not None:
+                raise JournalStateError(f"journal changed after loading: {self.path}") from error
+            actual = hashlib.sha256().digest()
+        except OSError as error:
+            raise JournalStateError(f"cannot verify journal {self.path}: {error}") from error
+        self._verify_snapshot()
+        if actual != self._content_hash.digest():
+            raise JournalStateError(f"journal contents changed after loading: {self.path}")
 
     def _append(self, row):
+        try:
+            self._write_attempt(row)
+        except JournalStateError:
+            raise
+        except (OSError, ValueError) as error:
+            raise JournalStateError(f"cannot write journal {self.path}: {error}") from error
+
+    def _write_attempt(self, row):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         request_id = row["request_id"]
-        row["attempt"] = self.attempt_counts.get(request_id, 0) + 1
-        payload = json.dumps(row, ensure_ascii=False, sort_keys=True,
-                             separators=(",", ":"), allow_nan=False) + "\n"
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        self.attempt_counts[request_id] = row["attempt"]
-        self.entries[request_id] = row
+        with self._path_lock() as (pin, exists):
+            self._verify_snapshot()
+            claim_journal_destination(self.path)
+            row["attempt"] = self.attempt_counts.get(request_id, 0) + 1
+            payload = json.dumps(row, ensure_ascii=False, sort_keys=True,
+                                 separators=(",", ":"), allow_nan=False).encode("utf-8") + b"\n"
+            if not exists:
+                self.path.touch()
+                pin(self.path)
+            with self.path.open("ab") as handle:
+                if self._snapshot_from_stat(os.fstat(handle.fileno())) != self._snapshot:
+                    raise JournalStateError(f"journal changed before append: {self.path}")
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+                self._snapshot = self._snapshot_from_stat(os.fstat(handle.fileno()))
+            self._verify_snapshot()
+            self._content_hash.update(payload)
+            self._remember(row, row["attempt"])
+
+    def _remember(self, row, attempt):
+        request_id = row["request_id"]
+        self.attempt_counts[request_id] = attempt
+        # Keep the first successful sample while retaining all attempts on disk.
+        if self.entries.get(request_id, {}).get("status") != "ok":
+            self.entries[request_id] = deepcopy(row)
 
     def completed(self, request):
         """Return the recorded successful response for ``request``, or None."""
+        self._verify_snapshot()
         previous = self.entries.get(digest(json.loads(json.dumps(request, allow_nan=False))))
-        return dict(previous["response"]) if previous and previous["status"] == "ok" else None
+        return deepcopy(previous["response"]) if previous and previous["status"] == "ok" else None
 
     def record_batch(self, requests, generate_many):
         """Run uncached requests in one backend batch and append every attempt.
@@ -170,15 +343,47 @@ class JournalBackend:
         ``generate_many`` returns one response or Exception per request, in order.
         Each attempt is journaled exactly as a single call would be; elapsed time
         is the batch wall time divided evenly, with the batch size retained.
-        Returns ``{request_id: exception}`` for the requests that failed.
+        A batch-level exception is journaled before retrying in smaller
+        batches within a shared submission budget. Returns ``{request_id: exception}`` for terminal request failures.
         """
         requests = [json.loads(json.dumps(request, allow_nan=False)) for request in requests]
         if len({digest(request) for request in requests}) != len(requests):
             raise ValueError("batched requests must be distinct")
         if any(self.completed(request) is not None for request in requests):
             raise ValueError("batched requests must not already be completed")
+
+        pending = [requests]
+        failures = {}
+        last_batch_error = None
+        for _ in range(MAX_BATCH_SUBMISSIONS):
+            batch = pending.pop()
+            attempt_failures, batch_error = self._record_batch_attempt(batch, generate_many)
+            if isinstance(batch_error, BatchEngineUnavailable):
+                raise batch_error
+            if batch_error is not None:
+                last_batch_error = batch_error
+            if batch_error is not None and len(batch) > 1:
+                midpoint = len(batch) // 2
+                pending.extend((batch[midpoint:], batch[:midpoint]))
+            else:
+                failures.update(attempt_failures)
+            if not pending:
+                return failures
+        raise BatchEngineUnavailable(
+            f"Batch recovery reached {MAX_BATCH_SUBMISSIONS} engine submissions. "
+            "Inspect the journal and backend failure before resuming."
+        ) from last_batch_error
+
+    def _record_batch_attempt(self, requests, generate_many):
         started = time.perf_counter()
-        results = list(generate_many(requests))
+        batch_error = None
+        try:
+            results = list(generate_many(requests))
+        except JournalStateError:
+            raise
+        except Exception as error:  # noqa: BLE001 - journal the failed engine submission
+            batch_error = error
+            results = [error] * len(requests)
         if len(results) != len(requests):
             raise ValueError("batched backend returned a different number of results")
         elapsed = (time.perf_counter() - started) / max(1, len(requests))
@@ -194,24 +399,25 @@ class JournalBackend:
             if isinstance(result, Exception):
                 failures[request_id] = result
                 self._append({"request_id": request_id, "request": request, "status": "error",
-                              "error": f"{type(result).__name__}: {result}", **timing})
+                              "error": format_error(result), **timing})
             else:
                 self._append({"request_id": request_id, "request": request, "status": "ok",
                               "response": result, **timing})
-        return failures
+        return failures, batch_error
 
     def __call__(self, request):
         request = json.loads(json.dumps(request, allow_nan=False))
         request_id = digest(request)
+        self._verify_snapshot()
         previous = self.entries.get(request_id)
         if previous and previous["status"] == "ok":
-            return dict(previous["response"])
+            return deepcopy(previous["response"])
         started = time.perf_counter()
         try:
             response = validate_response(self.backend(request))
         except Exception as error:
             self._append({"request_id": request_id, "request": request,
-                          "status": "error", "error": f"{type(error).__name__}: {error}",
+                          "status": "error", "error": format_error(error),
                           "elapsed_seconds": time.perf_counter() - started})
             raise
         self._append({"request_id": request_id, "request": request,
@@ -356,7 +562,7 @@ class VLLMBackend:
     """
     def __init__(self, spec: ModelSpec, *, dtype: str = "bfloat16", max_model_len: int = 8192,
                  gpu_memory_utilization: float = 0.9, identity=None):
-        from transformers import AutoConfig, AutoTokenizer
+        from transformers import AutoConfig
         if (Path(spec.model_id) / "adapter_config.json").exists():
             raise ValueError("pair inference requires a frozen base model, not an adapter")
         for identifier, revision in ((spec.model_id, spec.model_revision),
@@ -365,9 +571,7 @@ class VLLMBackend:
             if local_path.is_dir() and local_path.resolve().name != revision:
                 raise ValueError("local weights/tokenizer must use their immutable commit snapshot directory")
         self.spec = spec
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            spec.tokenizer_id, revision=spec.tokenizer_revision,
-            local_files_only=True, trust_remote_code=False)
+        self.tokenizer = self.load_tokenizer(spec)
         render_messages(self.tokenizer, [{"role": "user", "content": "Ready?"}])
         self.config = AutoConfig.from_pretrained(spec.model_id, revision=spec.model_revision,
                                                  local_files_only=True, trust_remote_code=False)
@@ -396,6 +600,12 @@ class VLLMBackend:
                        # Never let vLLM merge generation_config.json defaults on its own;
                        # every sampling value is passed explicitly below.
                        generation_config="vllm")
+
+    @staticmethod
+    def load_tokenizer(spec):
+        from transformers import AutoTokenizer
+        return AutoTokenizer.from_pretrained(spec.tokenizer_id, revision=spec.tokenizer_revision,
+                                             local_files_only=True, trust_remote_code=False)
 
     @staticmethod
     def _local_snapshot(identifier, revision):
@@ -487,10 +697,24 @@ class VLLMBackend:
             except Exception as error:  # noqa: BLE001 - per-request validation failure
                 results[index] = error
         if prepared:
-            outputs = self.llm.generate([TokensPrompt(prompt_token_ids=ids) for _, ids, _ in prepared],
-                                        [params for _, _, params in prepared], use_tqdm=False)
+            try:
+                outputs = self.llm.generate([TokensPrompt(prompt_token_ids=ids) for _, ids, _ in prepared],
+                                            [params for _, _, params in prepared], use_tqdm=False)
+            except Exception as error:
+                # Older vLLM runtimes may not expose the V1 exception type.
+                try:
+                    from vllm.v1.engine.exceptions import EngineDeadError
+                except ImportError:
+                    pass
+                else:
+                    if isinstance(error, EngineDeadError):
+                        raise BatchEngineUnavailable(str(error)) from error
+                # A retry must not consume queued outputs from the failed submission.
+                if self.llm.llm_engine.has_unfinished_requests():
+                    raise BatchEngineUnavailable("vLLM has unfinished requests after a failed batch") from error
+                raise
             if len(outputs) != len(prepared):
-                raise ValueError("vLLM returned a different number of outputs")
+                raise BatchEngineUnavailable("vLLM returned a different number of outputs")
             for (index, prompt_ids, _), output in zip(prepared, outputs):
                 try:
                     results[index] = self._response(requests[index], prompt_ids, output.outputs[0])

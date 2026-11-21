@@ -898,16 +898,40 @@ python -m secpo.crsecpo.pairs outputs/crsecpo/selected/train.jsonl \
   --model-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
   --tokenizer-id meta-llama/Llama-3.1-8B-Instruct \
   --tokenizer-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
-  --device cuda --seed 42 --max-candidates balanced \
+  --device cuda --seed 42 --max-candidates all \
   --journal outputs/crsecpo/pair_requests.jsonl \
   --outcomes outputs/crsecpo/pair_outcomes.jsonl \
   --output outputs/crsecpo/all_pairs.jsonl
 ```
 
-**Optional batched collection (vLLM).** Add `--backend vllm` (with `pip install vllm`
-on the GPU host) to run the same collection through batched vLLM generation, which
-should be much faster than the sequential default (measure it with a small pilot
-first). `--batch-size` (default 256) sets requests
+**Optional batched collection (vLLM).** On a supported Linux NVIDIA GPU host,
+create a collection-only Python environment on a GPU with BF16 support. vLLM
+0.34.0 requires Transformers 5.16.1 through 5.22.x, which conflicts with the
+training environment's 5.5.4 pin.
+Use the published [vLLM 0.34.0 dependency requirements](https://github.com/vllm-project/vllm/releases/tag/v0.34.0)
+and [GPU installation guide](https://docs.vllm.ai/en/v0.34.0/getting_started/installation/gpu/)
+to match the wheel to the host.
+
+```bash
+uv venv --python 3.12 .venv-vllm
+uv pip install --python .venv-vllm/bin/python --torch-backend=auto \
+  'vllm==0.34.0'
+uv pip check --python .venv-vllm/bin/python
+PYTHONPATH=src .venv-vllm/bin/python -m secpo.crsecpo.pairs --help
+uv pip freeze --python .venv-vllm/bin/python
+```
+
+Keep the resolved package versions with the run record. From the repository
+root, run the collection command above with
+`PYTHONPATH=src .venv-vllm/bin/python` in place of `python` and add
+`--backend vllm`. Use the separately installed training environment for freezing,
+training, and evaluation. Run a GPU pilot with `--max-candidates 16 --batch-size 8`
+and dedicated output, outcomes, and journal paths. Check that the summary has
+generation and judgment requests with usable results. If the pilot produces
+accepted pairs in both classes, run the freeze command on its pair export to
+check training eligibility before scaling up.
+
+`--batch-size` (default 256) sets requests
 per journaled engine batch; `--vllm-max-model-len` (default 8192) and
 `--vllm-gpu-memory-utilization` (default 0.9) configure the engine. What stays the
 same: prompts, chat rendering, stop tokens, the acceptance rule (the unchanged
@@ -924,14 +948,58 @@ unaffected and always uses the HF backend.
 Generation uses locally cached weights. Every request includes prompt, rendered
 chat template, model/tokenizer revisions, decoding settings and seed in its cache
 identity. The journal appends and syncs each attempt. Resume with the same command;
-completed requests are replayed without resampling. Do not share a journal between
-simultaneous writers. An interrupted final journal write is recovered on resume:
+completed requests are replayed without resampling. A fully cached vLLM run
+can re-export with the same installed dependencies and local tokenizer
+without starting the GPU worker. When a vLLM batch raises,
+the journal records the failure for each request in the batch, then retries in
+smaller batches to isolate failures. Each initial batch and its splits have a
+shared limit of 32 engine submissions. If that limit is exhausted, collection
+stops and preserves completed responses in the journal. Individual backend
+exceptions can be retried on resume. A separate engine process enforces
+`--vllm-timeout-seconds` (default 1800) for startup and each submission. A
+timeout stops the engine worker, journals the failed batch if one was submitted,
+and leaves completed responses available for resume. The worker also shuts
+down if the collector exits abruptly, and the watchdog also stops surviving
+engine processes if the worker dies. For a new vLLM run, a
+malformed or truncated output gets up to two retries with distinct deterministic
+seeds, for three samples total per request.
+The first usable sample is retained. The journal preserves every sample and the
+limit applies across restarts. Runs whose manifests predate output retries keep
+their original policy. Use new export paths to switch retry policies.
+If the engine dies or still has requests queued from a failed batch, collection
+stops after logging the failure. If no candidate has two valid judgments, the
+command exits with an error and keeps the journal for diagnosis. A candidate
+with an unusable vote is marked `judgment_error` in exported outcomes.
+Successful runs print the request and error counts for both stages and the
+number of fully judged candidates. The collection manifest is published
+atomically before collection starts. A second collector using the same journal
+path or a hard-linked alias exits before reading or updating the journal.
+Journals and exports share path locks and role markers so another run cannot
+reuse a journal as an export or an export as a journal. A journal preserves
+the first successful response for each request during replay.
+The journal is validated before claiming either destination. Both destination
+reservations record the run manifest digest before the manifest and public
+export sidecars are published. An interruption before both reservations are
+in place leaves a provisional claim that can be reused. After both are in
+place, resume with the same settings and paths.
+An interrupted final journal write is recovered on resume:
 the complete original file is preserved in an `.interrupted-<hash>` backup,
-validated records are retained, and only an incomplete final record is retried.
-Corrupt complete records still stop the run for inspection.
-Final pair/outcome exports are atomic; if interrupted, the
-journal contains progress even before a final export exists. This is separate
-from the filtering reviewers' per-row database.
+validated records are retained, and only a recognized incomplete final attempt
+is retried. A first fragment in an unmarked file cannot establish journal
+ownership, so it stays in place along with other unknown or corrupt content. Replay
+and publication check that the source journal has not changed or disappeared.
+Recovery and publication verify the journal bytes even when file size and
+timestamps match. The backup preserves the verified bytes in a separate file.
+The completion record binds the pair and outcome file hashes and, for new CLI
+exports, the collection manifest digest. When moving a collection, keep its
+`.collection.json`, `.exports.json`, and `.exports-ref.json` sidecars alongside the
+data files and preserve their relative layout. Move the version directory and
+relative links together, or copy the files and sidecars with links dereferenced.
+Training and pair-audit commands verify the recorded digests. A refresh keeps
+the previous complete version readable until one atomic pointer switch publishes
+the new files and completion record. Migration verifies the staged copy of a
+legacy export before switching any paths to it. Evaluation uses the same
+mechanism for results and summaries, including the manifest for aggregate runs.
 
 Export a blinded human sample of accepted pairs, ordinary wins, ties and order
 disagreements after collection:
@@ -949,12 +1017,14 @@ answer rubric as generation and judging. Incomplete pairs are accounted for in
 the manifest; original outcomes remain intact. Complete a copy of the form
 manually; this export does not approve or change any training pair.
 
-`--max-candidates` is an explicit call-budget ceiling, not a promised pair yield
-or a dollar cap. `balanced` sets it to twice the smaller class (2,154 candidates,
-at most 8,616 calls, for the 1,077 harmful rows in the current preview train split):
-the frozen selection is class-balanced, so candidates of the larger class beyond
-that prefix could never be selected. The resolved number and rule are recorded in
-the collection manifest. Candidate order
+`--max-candidates all` schedules every input candidate. Use a positive integer
+for a pilot with up to four base requests per candidate. With output retries,
+a new vLLM run can draw up to 12 samples per candidate before backend error recovery.
+The legacy `balanced` cap schedules twice the smaller class and can exclude
+majority-class candidates that would have passed judging and training checks.
+Balance the usable pairs at the freeze step. The resolved cap and any named
+rule are recorded in the collection manifest. Its `maximum_distinct_requests`
+field excludes retry attempts. Candidate order
 is fixed by seed, interleaved by class, and cycled across families before seeing
 model outcomes. The collection manifest retains scheduled and deferred IDs;
 the request journal and outcome records establish which calls actually completed.
@@ -975,9 +1045,13 @@ python -m secpo.crsecpo.training --config configs/train_crsecpo_llama31.json \
 This loads only the tokenizer, verifies recorded generations and both judgments,
 checks every reference context's length, and selects equal harmful/benign counts
 up to the requested limit. It retains every input ID in `selection_audit.jsonl`,
-including invalid, overlong, and valid unselected pairs. All original collection
-files remain intact. It refuses an empty class or replacement of an existing
-selection. Scientific training requires this frozen file and its manifest.
+including invalid, overlong, and valid unselected pairs. Freezing requires all
+eligible pairs to share a backend identity, generation settings, judge
+settings, and an output retry limit. The selection manifest records these
+settings. Resume older vLLM collections to re-export pairs that lack the retry
+limit. Freezing publishes the complete selection directory in one step and
+refuses to replace an existing selection. Scientific training requires this frozen file
+and its manifest.
 
 ### Train and check the comparison
 
@@ -1047,9 +1121,13 @@ revision in selection manifests.
 No surrogate scoring rule is implemented. See each subcommand's `--help` for file arguments.
 
 `aggregate` joins the per-checkpoint safety directories only when their frozen
-data, rubric, grader template, judge, and decoding match. Utility score records
+data, rubric, grader template, judge, and decoding match and each directory has
+exactly the expected safety jobs. Utility score records
 retain generation/scorer provenance. It reports unsafe assistance, refusal,
 permitted help, direct/rewrite transitions and family-cluster uncertainty.
+Use separate directories for safety, utility, and aggregate runs. Safety and
+utility claim their frozen protocol before generation and recheck it before
+publishing output.
 Missing, truncated, or ambiguous judgments are never treated as safe. The joint
 decision uses conservative paired family bounds, which may be inconclusive at
 these sample sizes: even zero observed accuracy loss has an upper bound of about
@@ -1128,10 +1206,11 @@ substituting an assumed format.
 
 ### Verification and remaining empirical work
 
-Run `python -m pytest tests/test_crsecpo_*.py -q` for adapter tests and `python -m
-pytest -q` for the full release suite. Tests include an inert end-to-end record →
-pair → four scoring paths fixture and tiny random local Llama/PEFT optimizer and
-generation checks. They do not establish performance on Llama-3.1-8B or replace
+Run `python -m pytest tests/test_crsecpo_*.py -q` for experiment tests and `python -m
+pytest -q` for the full release suite. Tests use scripted responses to carry
+records through collection and freezing into all four training modes. They use
+tiny random local Llama/PEFT models to check optimization and generation.
+These tests do not establish performance on Llama-3.1-8B or replace
 human data audits. The released full suite also contains Linux-only process tests;
 run those on the GPU host. Preserve any failures also present in the untouched
 upstream checkout instead of changing unrelated research machinery to hide them.

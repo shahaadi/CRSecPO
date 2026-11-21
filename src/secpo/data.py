@@ -255,13 +255,12 @@ def validate_preference_record(
     )
 
 
-def _read_json_records(path: Path) -> list[Any]:
+def _read_json_records(path: Path, *, payload: bytes | None = None) -> list[Any]:
     try:
+        data = path.read_bytes() if payload is None else payload
         if path.name.lower().endswith((".jsonl.gz", ".json.gz")):
-            with gzip.open(path, mode="rt", encoding="utf-8") as handle:
-                text = handle.read()
-        else:
-            text = path.read_text(encoding="utf-8")
+            data = gzip.decompress(data)
+        text = data.decode("utf-8")
     except (EOFError, gzip.BadGzipFile, OSError, UnicodeDecodeError) as error:
         raise PreferenceSchemaError(
             f"could not read preference file {path}: {error}"
@@ -274,7 +273,7 @@ def _read_json_records(path: Path) -> list[Any]:
         value = json.loads(text)
     except json.JSONDecodeError:
         records: list[Any] = []
-        for line_number, line in enumerate(text.splitlines(), start=1):
+        for line_number, line in enumerate(text.split("\n"), start=1):
             if not line.strip():
                 continue
             try:

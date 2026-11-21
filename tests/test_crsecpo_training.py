@@ -51,9 +51,10 @@ def row(**updates):
         model_spec=ModelSpec("org/model", "a"*40, "org/model", "a"*40))[0][0]
 
 
-def config(tmp_path, rows):
+def config(tmp_path, rows=None):
     path = tmp_path / "pairs.jsonl"
-    path.write_text("".join(json.dumps(item) + "\n" for item in rows))
+    if rows is not None:
+        path.write_text("".join(json.dumps(item) + "\n" for item in rows))
     return SimpleNamespace(data_file=str(path), max_length=10000, max_prompt_length=None,
                            append_eos=True, online_exchange_dir=None, seed=42,
                            model_name_or_path="org/model", model_revision="a" * 40)

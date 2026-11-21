@@ -325,13 +325,40 @@ def test_pair_answer_packet_blinds_origins_and_preserves_each_outcome_stratum(tm
     originals = {row["id"]: row for row in outcomes}
     for form, origin in zip(forms, key):
         assert form["review_id"] == origin["review_id"]
-        assert form["A"] == originals[origin["record_id"]]["generations"][origin["answer_origins"]["A"]]["response"]["text"]
+        original = originals[origin["record_id"]]
+        response = original["generations"][origin["answer_origins"]["A"]]["response"]
+        assert form["A"] == response["text"].removesuffix(original["completion_terminator"])
     assert source.read_bytes() == before
     reversed_source = tmp_path / "reversed.jsonl"
     atomic_write_jsonl(reversed(outcomes), reversed_source)
     export_pair_audit(tmp_path / "repeat", outcomes=reversed_source, rubric=rubric, per_stratum=2, seed=5)
     assert (tmp_path / "repeat" / "human.jsonl").read_bytes() == (packet / "human.jsonl").read_bytes()
     assert "do not change model judgments or grant grading_audit_passed" in (packet / "instructions.json").read_text()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_pair_audit_excludes_responses_with_wrong_terminator(tmp_path, exports, legacy):
+    from test_crsecpo_pairs import candidate, collect
+
+    _, _, rubric = exports
+
+    def wrong_terminator(request):
+        return {"text": "Unusable synthetic answer<eos>", "answer_text": "Unusable synthetic answer",
+                "finish_reason": "stop", "completion_terminator": "<eos>"}
+
+    _, bad_outcomes = collect(wrong_terminator, rows=[candidate(id="wrong-eos")], output_retries=2)
+    invalid = bad_outcomes[0]
+    assert invalid["status"] == "generation_error"
+    if legacy:
+        del invalid["completion_terminator"]
+    else:
+        for generation in invalid["generations"].values():
+            del generation["error"]
+    source = tmp_path / "outcomes.jsonl"
+    atomic_write_jsonl([invalid, saved_pair_outcome("valid")], source)
+    manifest = export_pair_audit(tmp_path / "packet", outcomes=source, rubric=rubric)
+    assert manifest["sampled"] == 1
+    assert manifest["excluded_incomplete_answer_ids"] == ["wrong-eos"]
 
 
 @pytest.mark.parametrize("corruption", ["target", "source", "ordinary_hash", "combined_hash",
