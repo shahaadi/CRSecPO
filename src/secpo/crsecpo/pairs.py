@@ -63,6 +63,32 @@ def ordered_by_class_and_family(rows, *, seed):
             for row in batch if row is not None]
 
 
+def balanced_candidate_cap(rows):
+    """Smallest prefix of the class-interleaved order that schedules every row of the
+    smaller class and an equal number of the larger one.
+
+    Frozen selection keeps equal harmful/benign counts, so candidates of the larger
+    class beyond this prefix cannot enter the balanced training file.
+    """
+    harmful = sum(row["selection_group"] == "harmful_benign_framing" for row in rows)
+    smaller = min(harmful, len(rows) - harmful)
+    if smaller < 1:
+        raise ValueError("a balanced candidate cap requires both harmful and benign candidates")
+    return 2 * smaller
+
+
+def _max_candidates(value):
+    if value == "balanced":
+        return value
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer or 'balanced'") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("--max-candidates must be positive")
+    return number
+
+
 def _validate_candidates(candidates):
     candidates = list(candidates)
     if not candidates:
@@ -201,8 +227,10 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--outcomes", type=Path, required=True)
     parser.add_argument("--journal", type=Path, required=True)
-    parser.add_argument("--max-candidates", type=int, required=True,
-                        help="Maximum candidate prefix; at most four model calls per candidate")
+    parser.add_argument("--max-candidates", type=_max_candidates, required=True,
+                        help="Maximum candidate prefix (at most four model calls per candidate), or "
+                             "'balanced' for twice the smaller class: every candidate that can enter "
+                             "the balanced frozen selection, and no others")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--model-revision", required=True)
     parser.add_argument("--tokenizer-id", required=True)
@@ -214,8 +242,6 @@ def main(argv=None):
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     args = parser.parse_args(argv)
-    if args.max_candidates < 1:
-        parser.error("--max-candidates must be positive")
     # Validate all inputs before importing an optional ML runtime or loading weights.
     manifest_path = args.output.with_suffix(args.output.suffix + ".collection.json")
     _validate_distinct_paths(candidates=args.candidates, output=args.output,
@@ -223,6 +249,9 @@ def main(argv=None):
     generation_config = GenerationConfig(args.max_new_tokens, args.temperature, args.top_p)
     judge_config = GenerationConfig(args.judge_max_new_tokens, args.temperature, args.top_p)
     rows = ordered_by_class_and_family(_validate_candidates(load_jsonl(args.candidates)), seed=args.seed)
+    cap_rule = None
+    if args.max_candidates == "balanced":
+        cap_rule, args.max_candidates = "balanced", balanced_candidate_cap(rows)
     spec = ModelSpec(args.model_id, args.model_revision, args.tokenizer_id, args.tokenizer_revision)
     from .records import sha256
     manifest = {"schema_version": "crsecpo-collection-v1", "input_sha256": sha256(args.candidates),
@@ -234,6 +263,8 @@ def main(argv=None):
         "scheduled_ids": [row["id"] for row in rows[:args.max_candidates]],
         "deferred_ids": [row["id"] for row in rows[args.max_candidates:]],
         "maximum_model_calls": 4 * min(len(rows), args.max_candidates)}
+    if cap_rule is not None:
+        manifest["max_candidates_rule"] = cap_rule
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != manifest:
             raise ValueError("collection settings changed; choose new export paths and retain the journal")

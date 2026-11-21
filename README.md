@@ -898,7 +898,7 @@ python -m secpo.crsecpo.pairs outputs/crsecpo/selected/train.jsonl \
   --model-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
   --tokenizer-id meta-llama/Llama-3.1-8B-Instruct \
   --tokenizer-revision 0e9e39f249a16976918f6564b8830bc894c89659 \
-  --device cuda --seed 42 --max-candidates 4096 \
+  --device cuda --seed 42 --max-candidates balanced \
   --journal outputs/crsecpo/pair_requests.jsonl \
   --outcomes outputs/crsecpo/pair_outcomes.jsonl \
   --output outputs/crsecpo/all_pairs.jsonl
@@ -933,7 +933,11 @@ the manifest; original outcomes remain intact. Complete a copy of the form
 manually; this export does not approve or change any training pair.
 
 `--max-candidates` is an explicit call-budget ceiling, not a promised pair yield
-or a dollar cap. The example permits at most 16,384 model calls. Candidate order
+or a dollar cap. `balanced` sets it to twice the smaller class (2,154 candidates,
+at most 8,616 calls, for the 1,077 harmful rows in the current preview train split):
+the frozen selection is class-balanced, so candidates of the larger class beyond
+that prefix could never be selected. The resolved number and rule are recorded in
+the collection manifest. Candidate order
 is fixed by seed, interleaved by class, and cycled across families before seeing
 model outcomes. The collection manifest retains scheduled and deferred IDs;
 the request journal and outcome records establish which calls actually completed.

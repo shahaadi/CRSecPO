@@ -296,6 +296,52 @@ def test_cli_caps_calls_records_unattempted_and_reuses_journal(tmp_path, monkeyp
     assert len(backend.requests) == 8 and (moved / paths["output"].name).read_bytes() == output
 
 
+def test_balanced_cap_schedules_every_minority_row_and_equal_majority(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from secpo.crsecpo import pairs as module
+    paths = {name: tmp_path / (name + ".jsonl")
+             for name in ("candidates", "output", "outcomes", "journal")}
+    rows = [candidate(id=f"h{i}", family_id=f"h{i}") for i in range(2)]
+    rows += [candidate(id=f"b{i}", family_id=f"b{i}", target_policy="permissible",
+                      selection_group="benign_adversarial_control") for i in range(5)]
+    paths["candidates"].write_text("".join(json.dumps(row) + "\n" for row in rows))
+    backend = ScriptedBackend(votes=["combined"] * 8)
+    backend.tokenizer = Tokenizer()
+    backend.model = SimpleNamespace(config=SimpleNamespace(model_type="llama"))
+    monkeypatch.setattr(module, "HFBackend", lambda *a, **kw: backend)
+    args = _cli_args(paths)
+    args[args.index("--max-candidates") + 1] = "balanced"
+    module.main(args)
+    manifest = json.loads(paths["output"].with_suffix(".jsonl.collection.json").read_text())
+    scheduled = manifest["scheduled_ids"]
+    assert manifest["max_candidates"] == 4 and manifest["max_candidates_rule"] == "balanced"
+    assert {"h0", "h1"} <= set(scheduled) and len(scheduled) == 4
+    assert sum(row_id.startswith("b") for row_id in scheduled) == 2
+    assert len(manifest["deferred_ids"]) == 3 and manifest["maximum_model_calls"] == 16
+    assert len(backend.requests) == 16
+    # Resuming with the same rule replays the journal; an equal explicit integer is a
+    # different recorded setting and must use new export paths.
+    module.main(args)
+    assert len(backend.requests) == 16
+    args[args.index("--max-candidates") + 1] = "4"
+    with pytest.raises(ValueError, match="collection settings changed"):
+        module.main(args)
+
+
+@pytest.mark.parametrize("value,error", [("0", SystemExit), ("lots", SystemExit), ("balanced", ValueError)])
+def test_invalid_or_one_class_cap_is_rejected_before_loading(tmp_path, monkeypatch, value, error):
+    from secpo.crsecpo import pairs as module
+    paths = {name: tmp_path / (name + ".jsonl")
+             for name in ("candidates", "output", "outcomes", "journal")}
+    paths["candidates"].write_text(json.dumps(candidate()) + "\n")
+    monkeypatch.setattr(module, "HFBackend", lambda *a, **kw: pytest.fail("must reject before model loading"))
+    args = _cli_args(paths)
+    args[args.index("--max-candidates") + 1] = value
+    with pytest.raises(error):
+        module.main(args)
+    assert not any(path.exists() for name, path in paths.items() if name != "candidates")
+
+
 @pytest.mark.parametrize("overlap", [False, True])
 def test_cli_rejects_directory_and_ancestor_file_paths_before_loading(tmp_path, monkeypatch, overlap):
     from secpo.crsecpo import pairs as module
