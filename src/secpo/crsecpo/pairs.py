@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Mapping
 
 from secpo.evaluation.sep_judge import atomic_write_jsonl, load_jsonl
-from .inference import (GenerationConfig, HFBackend, JournalBackend, ModelSpec,
+from .inference import (GenerationConfig, HFBackend, JournalBackend, ModelSpec, VLLMBackend,
                         make_request, render_messages, validate_response)
 from .prompts import (PROMPT_VERSION, RUBRIC, answer_messages, digest,
                       judging_orders, native_terminator)
@@ -136,12 +136,14 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                    judge_config: GenerationConfig = GenerationConfig(max_new_tokens=256),
                    seed: int = 0, deployment_system: str = "",
                    output_path: str | Path | None = None,
-                   outcomes_path: str | Path | None = None):
+                   outcomes_path: str | Path | None = None, backend_identity=None):
     """Return (accepted pairs, all outcomes), atomically exporting completed runs.
 
     Wrap ``backend`` in JournalBackend for per-request restart without resampling.
     Judge requests carry only rubric/target/anonymous answers. Their seeds differ
     by display order, making them separate samples even with deterministic seeds.
+    ``backend_identity`` (e.g. the vLLM engine) enters every request's identity and
+    the pair metadata; None leaves requests and metadata exactly as before.
     """
     candidates = _validate_candidates(candidates)
     terminator = native_terminator(tokenizer)
@@ -154,7 +156,8 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
         for condition in ("ordinary", "combined"):
             request = make_request(answer_messages(candidate, condition, deployment_system=deployment_system),
                 tokenizer=tokenizer, model_spec=model_spec, config=generation_config,
-                seed=_seed(seed, candidate["id"], condition), kind=condition)
+                seed=_seed(seed, candidate["id"], condition), kind=condition,
+                backend_identity=backend_identity)
             result = {"request_id": digest(request), "request": request}
             generations[condition] = result
             try:
@@ -168,7 +171,7 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                                                   answers["combined"], comparison_id=candidate["id"]):
                 request = make_request(messages, tokenizer=tokenizer, model_spec=model_spec,
                     config=judge_config, seed=_seed(seed, candidate["id"], f"judge-{order[0]}"),
-                    kind="preference_judgment")
+                    kind="preference_judgment", backend_identity=backend_identity)
                 vote = {"order": list(order), "request_id": digest(request), "request": request}
                 judgments.append(vote)
                 try:
@@ -208,6 +211,8 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                     "completion_terminator": terminator, "generations": generations, "judgments": judgments,
                     "completion_normalization": "append native terminator when absent; no other text changes",
                     "acceptance": "two_independent_swapped_orders_both_combined_wins_and_acceptable"}
+                if backend_identity is not None:
+                    metadata["backend_identity"] = backend_identity
                 pairs.append({**row, "chosen": completions["combined"], "rejected": completions["ordinary"],
                     "prompt": generations["ordinary"]["request"]["rendered_prompt"],
                     "clean_prompt": generations["combined"]["request"]["rendered_prompt"],
@@ -219,6 +224,59 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
     if outcomes_path is not None:
         atomic_write_jsonl(outcomes, outcomes_path)
     return pairs, outcomes
+
+
+class _Deferred(Exception):
+    """A planning-pass request that has not been generated yet."""
+
+
+def generate_pairs_batched(candidates, *, backend, journal, chunk_size=256,
+                           output_path=None, outcomes_path=None, **kwargs):
+    """Batched driver around the unchanged sequential ``generate_pairs``.
+
+    Acceptance logic is never duplicated. Each wave dry-runs ``generate_pairs``
+    with a planner that replays journaled responses and collects every request
+    still missing (wave 1: all answers; wave 2: judgments for complete answer
+    pairs). Those run in backend batches of ``chunk_size``, journaled after each
+    chunk so an interruption loses at most one chunk. A final ordinary
+    ``generate_pairs`` call then replays every response from the journal.
+
+    Each request is attempted at most once per invocation, as in the sequential
+    path; a request that fails is reported as failed and retried on resume.
+    """
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+    candidates = _validate_candidates(candidates)
+    failed = {}
+
+    def replay_or(on_missing):
+        def call(request):
+            request = json.loads(json.dumps(request, allow_nan=False))
+            request_id = digest(request)
+            if request_id in failed:
+                raise failed[request_id]  # the original exception, as the sequential path records it
+            response = journal.completed(request)
+            if response is not None:
+                return response
+            return on_missing(request_id, request)
+        return call
+
+    while True:
+        pending = {}
+        def plan(request_id, request):
+            pending.setdefault(request_id, request)
+            raise _Deferred(request_id)
+        generate_pairs(candidates, backend=replay_or(plan), **kwargs)
+        if not pending:
+            break
+        batch = list(pending.values())
+        for start in range(0, len(batch), chunk_size):
+            failed.update(journal.record_batch(batch[start:start + chunk_size], backend.generate_many))
+
+    def unexpected(request_id, request):
+        raise RuntimeError("request was not generated by the batched planner")
+    return generate_pairs(candidates, backend=replay_or(unexpected), output_path=output_path,
+                          outcomes_path=outcomes_path, **kwargs)
 
 
 def main(argv=None):
@@ -241,7 +299,18 @@ def main(argv=None):
     parser.add_argument("--judge-max-new-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--backend", choices=("hf", "vllm"), default="hf",
+                        help="hf: sequential transformers generate (default). vllm: batched vLLM; "
+                             "a separate experiment whose requests carry the engine identity")
+    parser.add_argument("--vllm-max-model-len", type=int, default=8192)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--batch-size", type=int, default=256,
+                        help="vLLM requests per journaled engine batch")
     args = parser.parse_args(argv)
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    if not 0 < args.vllm_gpu_memory_utilization <= 1:
+        parser.error("--vllm-gpu-memory-utilization must be in (0, 1]")
     # Validate all inputs before importing an optional ML runtime or loading weights.
     manifest_path = args.output.with_suffix(args.output.suffix + ".collection.json")
     _validate_distinct_paths(candidates=args.candidates, output=args.output,
@@ -253,6 +322,10 @@ def main(argv=None):
     if args.max_candidates == "balanced":
         cap_rule, args.max_candidates = "balanced", balanced_candidate_cap(rows)
     spec = ModelSpec(args.model_id, args.model_revision, args.tokenizer_id, args.tokenizer_revision)
+    backend_identity = None
+    if args.backend == "vllm":
+        # Computed from local files and the installed engine version, before loading weights.
+        backend_identity = VLLMBackend.identity_for(spec, max_model_len=args.vllm_max_model_len)
     from .records import sha256
     manifest = {"schema_version": "crsecpo-collection-v1", "input_sha256": sha256(args.candidates),
         "destinations": {name: os.path.relpath(path.resolve(), manifest_path.parent.resolve())
@@ -265,6 +338,8 @@ def main(argv=None):
         "maximum_model_calls": 4 * min(len(rows), args.max_candidates)}
     if cap_rule is not None:
         manifest["max_candidates_rule"] = cap_rule
+    if backend_identity is not None:
+        manifest["backend_identity"] = backend_identity
     if manifest_path.exists():
         if json.loads(manifest_path.read_text()) != manifest:
             raise ValueError("collection settings changed; choose new export paths and retain the journal")
@@ -276,6 +351,20 @@ def main(argv=None):
             json.dump(manifest, stream, indent=2)
             stream.write("\n")
     rows = rows[:args.max_candidates]
+    if args.backend == "vllm":
+        backend = VLLMBackend(spec, max_model_len=args.vllm_max_model_len,
+                              gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+                              identity=backend_identity)
+        if backend.model_type != "llama":
+            raise ValueError("CR-SecPO pair collection requires the pinned frozen Llama checkpoint")
+        pairs, outcomes = generate_pairs_batched(rows, backend=backend,
+            journal=JournalBackend(backend, args.journal), chunk_size=args.batch_size,
+            tokenizer=backend.tokenizer, model_spec=spec, seed=args.seed,
+            generation_config=generation_config, judge_config=judge_config,
+            backend_identity=backend_identity,
+            output_path=args.output, outcomes_path=args.outcomes)
+        print(json.dumps({"candidates": len(outcomes), "accepted_pairs": len(pairs)}))
+        return
     backend = HFBackend(spec, device=args.device)
     if getattr(backend.model.config, "model_type", None) != "llama":
         raise ValueError("CR-SecPO pair collection requires the pinned frozen Llama checkpoint")

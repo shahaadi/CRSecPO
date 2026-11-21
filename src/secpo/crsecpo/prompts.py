@@ -130,7 +130,8 @@ def validate_training_pair(row, tokenizer, model_id, model_revision, *,
             tokenizer=tokenizer, model_spec=ModelSpec(**model), seed=metadata["seed"],
             generation_config=GenerationConfig(**metadata["generation_config"]),
             judge_config=GenerationConfig(**metadata["judge_config"]),
-            deployment_system=metadata.get("deployment_system", ""))
+            deployment_system=metadata.get("deployment_system", ""),
+            backend_identity=metadata.get("backend_identity"))
         if len(rebuilt) != 1 or any(row.get(key) != rebuilt[0][key] for key in
                 ("chosen", "rejected", "prompt", "clean_prompt", "rubric_prompt", "pair_metadata")):
             raise ValueError("pair differs from accepted recorded ordinary/combined calls")

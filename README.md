@@ -904,6 +904,23 @@ python -m secpo.crsecpo.pairs outputs/crsecpo/selected/train.jsonl \
   --output outputs/crsecpo/all_pairs.jsonl
 ```
 
+**Optional batched collection (vLLM).** Add `--backend vllm` (with `pip install vllm`
+on the GPU host) to run the same collection through batched vLLM generation, which
+should be much faster than the sequential default (measure it with a small pilot
+first). `--batch-size` (default 256) sets requests
+per journaled engine batch; `--vllm-max-model-len` (default 8192) and
+`--vllm-gpu-memory-utilization` (default 0.9) configure the engine. What stays the
+same: prompts, chat rendering, stop tokens, the acceptance rule (the unchanged
+`generate_pairs` runs over the recorded calls), per-request seeds, and the effective
+HF sampling settings, including the transformers `top_k=50` default the sequential
+path applies implicitly. What differs: outputs are new samples, not token-identical
+to the HF backend, because batched kernels and vLLM's sampler differ numerically.
+Every request and pair therefore records the engine identity (vLLM version, dtype,
+context length, sampling defaults), so a vLLM collection is a separate experiment:
+it never reuses or mixes with HF journal entries, and reusing an HF collection's
+export paths is refused. Collect all pairs with one backend. Evaluation is
+unaffected and always uses the HF backend.
+
 Generation uses locally cached weights. Every request includes prompt, rendered
 chat template, model/tokenizer revisions, decoding settings and seed in its cache
 identity. The journal appends and syncs each attempt. Resume with the same command;
