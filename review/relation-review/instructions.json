@@ -1,0 +1,8 @@
+{
+  "decisions": [
+    "link",
+    "no_link",
+    "unsure"
+  ],
+  "instructions": "Edit only decision and reason in a COPY of the form. For family, decide whether the two records are the same request family or semantic near-duplicates that must stay in one split. For control, decide whether the benign request matches the harmful request in topic and framing style. Use link, no_link, or unsure, with a reason. Review only; do not rewrite either text."
+}
