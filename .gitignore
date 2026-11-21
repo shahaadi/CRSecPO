@@ -10,6 +10,7 @@ dist/
 *.egg-info/
 
 outputs/
+CRSecPO Dataset Filtering/
 checkpoints/
 logs/
 runs/
@@ -25,6 +26,8 @@ data/*
 !data/example_preferences.jsonl
 !data/qwen36_offline_dataset/
 !data/qwen36_offline_dataset/**
+!data/crsecpo_preview/
+!data/crsecpo_preview/**
 
 *.env
 *.key

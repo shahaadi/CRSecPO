@@ -1,0 +1,32 @@
+{
+  "accepted_by_split_group": {
+    "test": {
+      "benign_adversarial_control": 6,
+      "harmful_benign_framing": 18
+    },
+    "train": {
+      "benign_adversarial_control": 1639,
+      "harmful_benign_framing": 1077
+    },
+    "validation": {
+      "benign_adversarial_control": 159,
+      "harmful_benign_framing": 113
+    }
+  },
+  "counts": {
+    "quarantine": 260797,
+    "test": 24,
+    "train": 2716,
+    "validation": 272
+  },
+  "eval_master_sha256": "810064ab40252391e803a43cec14da8a31f1597fc93ba34d6371139794997112",
+  "schema_version": 1,
+  "seed": 42,
+  "selection_status_counts": {
+    "accepted": 3012,
+    "rejected": 260797
+  },
+  "total_assignments": 263809,
+  "train_master_sha256": "749869187ccc91bd4b347d08c8f6c0efb371cb91386efc3d054fc321369a37ef",
+  "validation_fraction": 0.1
+}
