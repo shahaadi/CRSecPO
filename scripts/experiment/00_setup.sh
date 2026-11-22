@@ -14,6 +14,7 @@ echo "== Stage 0: setup =="
 pip install -q --upgrade pip
 pip install -q -e "${REPO_ROOT}" --no-deps
 pip install -q "transformers>=5.5" "peft>=0.19" "datasets>=4" "accelerate>=1.1" "safetensors>=0.7"
+pip install -q "openai>=1.40"   # optional OpenAI grading judge for stage 4
 # PEFT eagerly version-checks torchao during LoRA injection and errors on the old
 # torchao Colab preinstalls. We never use torchao (plain bf16 LoRA), so remove it.
 pip uninstall -q -y torchao 2>/dev/null || true
