@@ -77,11 +77,13 @@ def sequence_logps(
     ):
         raise ValueError("labels contain a token id outside the logits vocabulary")
 
-    token_logps = F.log_softmax(shifted_logits, dim=-1).gather(
-        dim=-1,
-        index=safe_labels.unsqueeze(-1),
-    )
-    token_logps = token_logps.squeeze(-1)
+    # Memory-efficient per-token log-probability: gather the label's logit and
+    # subtract the log-partition. Mathematically identical to
+    # ``log_softmax(logits).gather(label)`` but avoids materializing the full
+    # [batch, sequence, vocabulary] softmax tensor -- the dominant allocation,
+    # and what OOMs on 24 GB GPUs given four forward passes over long sequences.
+    selected = shifted_logits.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    token_logps = selected - torch.logsumexp(shifted_logits, dim=-1)
     return token_logps.masked_fill(~response_mask, 0.0).sum(dim=-1)
 
 

@@ -56,6 +56,9 @@ export AGG_DIR="${WORK}/aggregate"
 export CFG_DIR="${WORK}/configs"              # generated configs
 
 # ---- compute knobs ----
+# Reduce CUDA allocator fragmentation (frees reserved-but-unallocated memory);
+# this is what lets CRSecPO's four forward passes fit on a 24 GB card.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PAIRS_BACKEND="${PAIRS_BACKEND:-vllm}" # 'vllm' (batched, GPU) or 'hf' (sequential)
 export DEVICE="${DEVICE:-cuda}"
 # 0 = judge-free: accept chosen=combined/rejected=ordinary whenever they differ
