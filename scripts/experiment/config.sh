@@ -78,13 +78,16 @@ GPU_MEM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 
 if [ "${GPU_MEM_MB}" -ge 38000 ]; then
   GPU_TIER="large (A100/40GB+)"; _VMEM=0.90; _VLEN=8192; _BATCH=2; _ACCUM=32
 else
-  GPU_TIER="small (<=24GB, e.g. L4)"; _VMEM=0.85; _VLEN=4096; _BATCH=1; _ACCUM=64
+  # On a 24GB card the 8B weights (~15GB) dominate, so a HIGHER fraction is what
+  # leaves room for the KV cache (and thus batching throughput), not a lower one.
+  GPU_TIER="small (<=24GB, e.g. L4)"; _VMEM=0.92; _VLEN=4096; _BATCH=1; _ACCUM=64
 fi
-export VLLM_GPU_MEM="${VLLM_GPU_MEM:-$_VMEM}"  # vLLM pair-gen GPU fraction
-export VLLM_MAX_LEN="${VLLM_MAX_LEN:-$_VLEN}"  # vLLM context budget
-export TRAIN_BATCH="${TRAIN_BATCH:-$_BATCH}"   # per-device train batch
-export GRAD_ACCUM="${GRAD_ACCUM:-$_ACCUM}"     # accumulation (effective batch = BATCH*ACCUM = 64)
-echo "[config] gpu=${GPU_MEM_MB}MB tier=${GPU_TIER}; vllm_mem=${VLLM_GPU_MEM} vllm_len=${VLLM_MAX_LEN} batch=${TRAIN_BATCH} accum=${GRAD_ACCUM}"
+# Named without a VLLM_ prefix so vLLM does not flag them as unknown env vars.
+export PAIRS_GPU_MEM="${PAIRS_GPU_MEM:-$_VMEM}"  # vLLM pair-gen GPU fraction
+export PAIRS_MAX_LEN="${PAIRS_MAX_LEN:-$_VLEN}"  # vLLM context budget
+export TRAIN_BATCH="${TRAIN_BATCH:-$_BATCH}"     # per-device train batch
+export GRAD_ACCUM="${GRAD_ACCUM:-$_ACCUM}"       # accumulation (effective batch = BATCH*ACCUM = 64)
+echo "[config] gpu=${GPU_MEM_MB}MB tier=${GPU_TIER}; vllm_mem=${PAIRS_GPU_MEM} vllm_len=${PAIRS_MAX_LEN} batch=${TRAIN_BATCH} accum=${GRAD_ACCUM}"
 
 mkdir -p "${WORK}" "${PAIRS_DIR}" "${TRAIN_OUT}" "${EVAL_DIR}" "${AGG_DIR}" "${CFG_DIR}"
 
