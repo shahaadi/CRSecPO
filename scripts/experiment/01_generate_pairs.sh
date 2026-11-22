@@ -34,6 +34,7 @@ gen () {  # $1 = split name, $2 = candidates file
     --tokenizer-id "${TOKENIZER_ID}" --tokenizer-revision "${TOKENIZER_REVISION}" \
     --seed "${SEED}" --device "${DEVICE}" --backend "${PAIRS_BACKEND}" \
     --vllm-gpu-memory-utilization "${PAIRS_GPU_MEM}" --vllm-max-model-len "${PAIRS_MAX_LEN}" \
+    --batch-size "${BATCH_SIZE}" \
     ${JUDGE_ARG}
 }
 
