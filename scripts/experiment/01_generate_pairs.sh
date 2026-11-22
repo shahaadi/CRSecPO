@@ -31,6 +31,16 @@ fi
 
 gen () {  # $1 = split name, $2 = candidates file
   local split="$1" cand="$2"
+  local out="${PAIRS_DIR}/${split}_pairs.jsonl"
+  # Idempotent: if this split's pair export already exists, keep it and do NOT
+  # re-enter pair generation. reuse_pairs.sh reads these exports raw (immune to
+  # Drive-corrupted sidecars) and folds them into the training set, so once the
+  # export is present there is no reason to touch the resumable reservation path
+  # (whose sidecar JSON is exactly what Google Drive tends to truncate to empty).
+  if [ -s "${out}" ]; then
+    echo "--- ${split}: ${out} already present ($(wc -l < "${out}") pairs); skipping generation ---"
+    return 0
+  fi
   echo "--- ${split} pairs from ${cand} ---"
   python -m secpo.crsecpo.pairs "${cand}" \
     --output   "${PAIRS_DIR}/${split}_pairs.jsonl" \

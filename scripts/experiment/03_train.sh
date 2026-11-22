@@ -6,7 +6,9 @@
 # base is NOT trained; it is the frozen model, evaluated directly in stage 4.
 #
 # All three use the SAME config (only --method differs) so they stay comparable.
-# Validation is on: each arm keeps the checkpoint with the best eval_loss.
+# Full-epoch training: each arm trains one epoch and keeps the end-of-epoch model
+# (there is no validation-based checkpoint selection; step checkpoints exist only
+# so an interrupted run can resume). An arm with a final adapter is skipped.
 set -euo pipefail
 # Capture the script dir before config.sh changes the working directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
