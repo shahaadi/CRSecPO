@@ -43,15 +43,30 @@ print(os.environ["OUT"])
 PY
 }
 
+eval_safety () {  # run one checkpoint; args: checkpoint, config, output-dir
+  python -m secpo.crsecpo.evaluation safety \
+    --config "$2" --input "${TEST_CANDIDATES}" --checkpoint "$1" --output-dir "$3"
+}
+
 run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   local ck="$1" adapter="$2"
   local cfg; cfg="$(make_eval_config "${ck}" "${adapter}")"
+  local out="${EVAL_DIR}/${ck}" log="${CFG_DIR}/eval_${ck}.log"
   echo "--- safety: ${ck} ---"
-  python -m secpo.crsecpo.evaluation safety \
-    --config "${cfg}" \
-    --input "${TEST_CANDIDATES}" \
-    --checkpoint "${ck}" \
-    --output-dir "${EVAL_DIR}/${ck}"
+  # Journaled: a prior run with the SAME protocol replays/resumes. But if this dir
+  # holds a protocol from a DIFFERENT configuration (e.g. you switched generation to
+  # vLLM or added the OpenAI judge), its hash won't match and resume is impossible.
+  # Rather than abort the whole stage, restart just THIS checkpoint from a fresh dir.
+  if ! eval_safety "${ck}" "${cfg}" "${out}" 2>&1 | tee "${log}"; then
+    if grep -q "resume protocol hash mismatch" "${log}"; then
+      echo "    (eval config changed since the last run; restarting ${ck} from a fresh dir)"
+      rm -rf "${out}"
+      eval_safety "${ck}" "${cfg}" "${out}"
+    else
+      echo "    (eval failed for ${ck}; see ${log})" >&2
+      exit 1
+    fi
+  fi
 }
 
 run_ck base    "";                backup_work
