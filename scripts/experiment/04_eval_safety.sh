@@ -8,6 +8,15 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 echo "== Stage 4: safety evaluation on test =="
 
+# Each checkpoint can take tens of minutes, so mirror the journals to the Drive
+# backup every 2 min (and on exit), not just after each checkpoint -- a disconnect
+# mid-checkpoint then loses little. The eval is journaled, so the resumed run
+# replays completed generations/grades.
+if [ -n "${DRIVE_BACKUP:-}" ]; then
+  ( while true; do sleep 120; backup_work; done ) & SYNC_PID=$!
+  trap 'kill ${SYNC_PID} 2>/dev/null || true; backup_work' EXIT
+fi
+
 make_eval_config () {  # $1 = checkpoint, $2 = adapter_dir ("" for base) -> prints config path
   local ck="$1" adapter="$2" out="${CFG_DIR}/eval_${ck}.json"
   REPO_ROOT="${REPO_ROOT}" CK="${ck}" ADAPTER="${adapter}" OUT="${out}" \
