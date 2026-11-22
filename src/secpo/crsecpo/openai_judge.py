@@ -13,6 +13,7 @@ backoff so they don't halt the whole run.
 """
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 import json
 import os
 import time
@@ -46,12 +47,16 @@ class _StubTokenizer:
         return json.dumps(messages, ensure_ascii=False, sort_keys=True)
 
 
-class _StubSpec:
-    def __init__(self, identity):
-        self._identity = dict(identity)
+@dataclass(frozen=True)
+class _OpenAIJudgeSpec:
+    """Judge identity. A dataclass so the caller's dataclasses.asdict() works,
+    mirroring the local ModelSpec; also exposes to_dict() for make_request."""
+
+    provider: str
+    model: str
 
     def to_dict(self):
-        return dict(self._identity)
+        return asdict(self)
 
 
 class OpenAIJudgeBackend:
@@ -75,7 +80,7 @@ class OpenAIJudgeBackend:
         identity = {"schema_version": SCHEMA_VERSION, "provider": "openai",
                     "model": self.model, "temperature": self.temperature,
                     "response_format": "json_schema", "grade_schema": _GRADE_SCHEMA}
-        self.spec = _StubSpec({"provider": "openai", "model": self.model})
+        self.spec = _OpenAIJudgeSpec(provider="openai", model=self.model)
         self.tokenizer = _StubTokenizer()
         self.fingerprint = identity
         self._client = OpenAI()
