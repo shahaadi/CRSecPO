@@ -37,6 +37,10 @@ for METHOD in sft dpo crsecpo; do
     echo "--- ${METHOD}: resuming from checkpoint-${latest} ---"
     train_method "${METHOD}" --resume-from-checkpoint "${OUT}/checkpoint-${latest}"
   else
+    # No finished adapter and no resumable checkpoint: anything here is a stale
+    # manifest from a failed earlier attempt (e.g. different pairs/settings).
+    # Clear it so the run isn't blocked by the manifest-mismatch guard.
+    rm -rf "${OUT}"
     echo "--- ${METHOD}: training from scratch ---"
     train_method "${METHOD}"
   fi
