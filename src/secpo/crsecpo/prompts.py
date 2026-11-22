@@ -120,13 +120,16 @@ def validate_training_pair(row, tokenizer, model_id, model_revision, *,
     from .inference import GenerationConfig
     from .pairs import generate_pairs
     try:
+        # Judge-free pairs record only the two answer calls; judged pairs add two
+        # judgment calls. The empty judgment list distinguishes them.
+        judged = bool(metadata["judgments"])
         entries = [metadata["generations"][name] for name in ("ordinary", "combined")]
         entries += metadata["judgments"]
         samples = [sample for entry in entries for sample in [*entry.get("prior_samples", ()), entry]]
         responses = {sample["request_id"]: sample["response"] for sample in samples
                      if digest(sample["request"]) == sample["request_id"]}
-        if len(entries) != 4 or len(responses) != len(samples):
-            raise ValueError("pair needs four distinct, hash-verified recorded calls and valid retry provenance")
+        if len(entries) != (4 if judged else 2) or len(responses) != len(samples):
+            raise ValueError("pair needs its distinct, hash-verified recorded calls and valid retry provenance")
         observed_retries = max(len(entry.get("prior_samples", ())) for entry in entries)
         rebuilt, _ = generate_pairs([row], backend=lambda request: responses[digest(request)],
             tokenizer=tokenizer, model_spec=ModelSpec(**model), seed=metadata["seed"],
@@ -134,7 +137,7 @@ def validate_training_pair(row, tokenizer, model_id, model_revision, *,
             judge_config=GenerationConfig(**metadata["judge_config"]),
             deployment_system=metadata.get("deployment_system", ""),
             backend_identity=metadata.get("backend_identity"),
-            output_retries=metadata.get("max_output_retries", observed_retries))
+            output_retries=metadata.get("max_output_retries", observed_retries), judge=judged)
         if rebuilt and "max_output_retries" not in metadata:
             del rebuilt[0]["pair_metadata"]["max_output_retries"]
         if len(rebuilt) != 1 or any(row.get(key) != rebuilt[0][key] for key in

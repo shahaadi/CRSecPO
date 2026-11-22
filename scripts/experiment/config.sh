@@ -58,6 +58,9 @@ export CFG_DIR="${WORK}/configs"              # generated configs
 # ---- compute knobs ----
 export PAIRS_BACKEND="${PAIRS_BACKEND:-vllm}" # 'vllm' (batched, GPU) or 'hf' (sequential)
 export DEVICE="${DEVICE:-cuda}"
+# 0 = judge-free: accept chosen=combined/rejected=ordinary whenever they differ
+# (relies on the combined answer being generally better). 1 = run the preference judge.
+export USE_JUDGE="${USE_JUDGE:-0}"
 # Start SMALL to prove the pipeline end to end, then set to 'all' for the real run.
 export MAX_CANDIDATES="${MAX_CANDIDATES:-20}"
 export PAIR_LIMIT="${PAIR_LIMIT:-2048}"       # even; cap on the balanced train set

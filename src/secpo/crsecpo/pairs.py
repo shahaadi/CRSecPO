@@ -262,7 +262,8 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                    judge_config: GenerationConfig = GenerationConfig(max_new_tokens=256),
                    seed: int = 0, deployment_system: str = "",
                    output_path: str | Path | None = None,
-                   outcomes_path: str | Path | None = None, backend_identity=None, output_retries=0):
+                   outcomes_path: str | Path | None = None, backend_identity=None, output_retries=0,
+                   judge=True):
     """Return (accepted pairs, all outcomes), atomically exporting completed runs.
 
     Wrap ``backend`` in JournalBackend for per-request restart without resampling.
@@ -270,6 +271,11 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
     by display order, making them separate samples even with deterministic seeds.
     ``backend_identity`` (e.g. the vLLM engine) enters every request's identity and
     the pair metadata; None leaves requests and metadata exactly as before.
+
+    With ``judge=False`` no preference judge runs: the rubric-conditioned
+    (combined) answer is taken as ``chosen`` and the ordinary answer as
+    ``rejected`` whenever both generate and differ. Relies on the combined answer
+    being generally better rather than verifying it per pair.
     """
     # Provenance replay also supports pairs collected with the earlier three-retry policy.
     if type(output_retries) is not int or not 0 <= output_retries <= 3:
@@ -294,26 +300,33 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
             if parsed is not None:
                 completions[condition], answers[condition] = parsed
         if len(completions) == 2:
-            for order, messages in judging_orders(candidate["target"], answers["ordinary"],
-                                                  answers["combined"], comparison_id=candidate["id"]):
-                request = make_request(messages, tokenizer=tokenizer, model_spec=model_spec,
-                    config=judge_config, seed=_seed(seed, candidate["id"], f"judge-{order[0]}"),
-                    kind="preference_judgment", backend_identity=backend_identity)
-                vote, parsed = _sample(request, backend, lambda response: _judge(response, terminator, order),
-                                       output_retries)
-                vote["order"] = list(order)
-                vote.update(parsed if parsed is not None else {"outcome": "error"})
-                judgments.append(vote)
-            vote_outcomes = [vote["outcome"] for vote in judgments]
-            accepted = (vote_outcomes == ["combined_wins", "combined_wins"]
-                        and all(vote.get("combined_acceptable") is True for vote in judgments)
-                        and completions["combined"] != completions["ordinary"])
-            status = "not_unanimous_combined"
-            if "error" in vote_outcomes:
-                status = "judgment_error"
-            elif accepted:
-                status = "accepted"
-            outcome.update(accepted=accepted, status=status, vote_outcomes=vote_outcomes)
+            if judge:
+                for order, messages in judging_orders(candidate["target"], answers["ordinary"],
+                                                      answers["combined"], comparison_id=candidate["id"]):
+                    request = make_request(messages, tokenizer=tokenizer, model_spec=model_spec,
+                        config=judge_config, seed=_seed(seed, candidate["id"], f"judge-{order[0]}"),
+                        kind="preference_judgment", backend_identity=backend_identity)
+                    vote, parsed = _sample(request, backend, lambda response: _judge(response, terminator, order),
+                                           output_retries)
+                    vote["order"] = list(order)
+                    vote.update(parsed if parsed is not None else {"outcome": "error"})
+                    judgments.append(vote)
+                vote_outcomes = [vote["outcome"] for vote in judgments]
+                accepted = (vote_outcomes == ["combined_wins", "combined_wins"]
+                            and all(vote.get("combined_acceptable") is True for vote in judgments)
+                            and completions["combined"] != completions["ordinary"])
+                status = "not_unanimous_combined"
+                if "error" in vote_outcomes:
+                    status = "judgment_error"
+                elif accepted:
+                    status = "accepted"
+                acceptance = "two_independent_swapped_orders_both_combined_wins_and_acceptable"
+                outcome.update(accepted=accepted, status=status, vote_outcomes=vote_outcomes)
+            else:
+                accepted = completions["combined"] != completions["ordinary"]
+                status = "accepted" if accepted else "combined_equals_ordinary"
+                acceptance = "combined_over_ordinary_without_judge"
+                outcome.update(accepted=accepted, status=status, vote_outcomes=[])
             if accepted:
                 metadata = {"schema_version": "crsecpo-pair-v1", "model": model_spec.to_dict(),
                     "prompt_version": PROMPT_VERSION, "rubric": RUBRIC,
@@ -322,7 +335,7 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                     "max_output_retries": output_retries,
                     "completion_terminator": terminator, "generations": generations, "judgments": judgments,
                     "completion_normalization": "append native terminator when absent; no other text changes",
-                    "acceptance": "two_independent_swapped_orders_both_combined_wins_and_acceptable"}
+                    "acceptance": acceptance}
                 if backend_identity is not None:
                     metadata["backend_identity"] = backend_identity
                 pairs.append({**row, "chosen": completions["combined"], "rejected": completions["ordinary"],
@@ -414,13 +427,18 @@ def generate_pairs_batched(candidates, *, journal, backend=None, start_backend=N
         if requests and errors == requests:
             raise RuntimeError(f"vLLM collection failed: {errors}/{requests} {stage} requests "
                                f"produced no usable results. Inspect {journal.path}.")
-    if not counts["judgment_requests"]:
-        raise RuntimeError(f"vLLM collection failed: no candidate had two usable answers "
+    if kwargs.get("judge", True):
+        if not counts["judgment_requests"]:
+            raise RuntimeError(f"vLLM collection failed: no candidate had two usable answers "
+                               f"({counts['generation_errors']}/{counts['generation_requests']} generation errors). "
+                               f"Inspect {journal.path}.")
+        if not counts["fully_judged_candidates"]:
+            raise RuntimeError(f"vLLM collection failed: no candidate had two valid judgments "
+                               f"({counts['judgment_errors']}/{counts['judgment_requests']} judgment errors). "
+                               f"Inspect {journal.path}.")
+    elif not any(row["accepted"] for row in outcomes):
+        raise RuntimeError(f"vLLM collection failed: no candidate produced two differing answers "
                            f"({counts['generation_errors']}/{counts['generation_requests']} generation errors). "
-                           f"Inspect {journal.path}.")
-    if not counts["fully_judged_candidates"]:
-        raise RuntimeError(f"vLLM collection failed: no candidate had two valid judgments "
-                           f"({counts['judgment_errors']}/{counts['judgment_requests']} judgment errors). "
                            f"Inspect {journal.path}.")
     with journal.publication_snapshot() as verify_source:
         _export_collection(pairs, outcomes, output_path, outcomes_path, verify_source=verify_source)
@@ -443,6 +461,10 @@ def main(argv=None):
     parser.add_argument("--tokenizer-id", required=True)
     parser.add_argument("--tokenizer-revision", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-judge", dest="judge", action="store_false",
+                        help="Skip the preference judge: accept chosen=combined/rejected=ordinary "
+                             "whenever the two answers differ (relies on combined being generally better)")
+    parser.set_defaults(judge=True)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--judge-max-new-tokens", type=int, default=256)
@@ -530,9 +552,13 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
         "prompt_version": PROMPT_VERSION,
         "scheduled_ids": [row["id"] for row in rows[:args.max_candidates]],
         "deferred_ids": [row["id"] for row in rows[args.max_candidates:]],
-        "maximum_distinct_requests": 4 * min(len(rows), args.max_candidates)}
+        "maximum_distinct_requests": (2 if not args.judge else 4) * min(len(rows), args.max_candidates)}
     if cap_rule is not None:
         manifest["max_candidates_rule"] = cap_rule
+    if not args.judge:
+        # Absent on judged runs, so existing manifests compare unchanged; a judge-free
+        # resume cannot silently reuse a judged journal and vice versa.
+        manifest["judge"] = False
     if backend_identity is not None:
         manifest["backend_identity"] = backend_identity
         manifest["max_output_retries"] = MAX_OUTPUT_RETRIES
@@ -593,7 +619,7 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
                 journal=journal, chunk_size=args.batch_size,
                 tokenizer=tokenizer, model_spec=spec, seed=args.seed,
                 generation_config=generation_config, judge_config=judge_config,
-                backend_identity=backend_identity, output_retries=output_retries)
+                backend_identity=backend_identity, output_retries=output_retries, judge=args.judge)
         with journal.publication_snapshot() as verify_source:
             write_collection_exports(pairs, outcomes, args.output, args.outcomes, manifest=recorded,
                                      verify_source=verify_source)
@@ -607,7 +633,7 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
     pairs, outcomes = generate_pairs(rows, backend=journal,
         tokenizer=backend.tokenizer, model_spec=spec, seed=args.seed,
         generation_config=generation_config,
-        judge_config=judge_config)
+        judge_config=judge_config, judge=args.judge)
     with journal.publication_snapshot() as verify_source:
         write_collection_exports(pairs, outcomes, args.output, args.outcomes, manifest=recorded,
                                  verify_source=verify_source)

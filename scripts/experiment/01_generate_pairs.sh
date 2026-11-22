@@ -10,7 +10,10 @@
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
-echo "== Stage 1: generate pairs (backend=${PAIRS_BACKEND}, max_candidates=${MAX_CANDIDATES}) =="
+JUDGE_ARG="--no-judge"
+[ "${USE_JUDGE}" = "1" ] && JUDGE_ARG=""
+
+echo "== Stage 1: generate pairs (backend=${PAIRS_BACKEND}, max_candidates=${MAX_CANDIDATES}, judge=${USE_JUDGE}) =="
 
 # Pair generation is the long stage. If a Drive backup is configured, mirror the
 # journal to it every 2 min (and once more on exit) so a disconnect loses little.
@@ -30,7 +33,8 @@ gen () {  # $1 = split name, $2 = candidates file
     --model-id "${MODEL_ID}" --model-revision "${MODEL_REVISION}" \
     --tokenizer-id "${TOKENIZER_ID}" --tokenizer-revision "${TOKENIZER_REVISION}" \
     --seed "${SEED}" --device "${DEVICE}" --backend "${PAIRS_BACKEND}" \
-    --vllm-gpu-memory-utilization "${VLLM_GPU_MEM}" --vllm-max-model-len "${VLLM_MAX_LEN}"
+    --vllm-gpu-memory-utilization "${VLLM_GPU_MEM}" --vllm-max-model-len "${VLLM_MAX_LEN}" \
+    ${JUDGE_ARG}
 }
 
 gen train      "${TRAIN_CANDIDATES}"
