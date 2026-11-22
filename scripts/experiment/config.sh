@@ -42,6 +42,23 @@ export SEED="${SEED:-42}"
 export EVAL_STEPS="${EVAL_STEPS:-8}"
 export SAVE_STEPS="${SAVE_STEPS:-8}"
 
+# ---- GPU auto-tuning (automatic; you don't set anything) ----
+# Reads the card's VRAM and picks safe memory settings. A100/40GB+ gets the full
+# setup; 24GB cards (L4/4090/3090) get the conservative one so the 8B model fits.
+# Any value can still be forced by exporting it before sourcing this file.
+GPU_MEM_MB="$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' ' || true)"
+[[ "${GPU_MEM_MB}" =~ ^[0-9]+$ ]] || GPU_MEM_MB=0
+if [ "${GPU_MEM_MB}" -ge 38000 ]; then
+  GPU_TIER="large (A100/40GB+)"; _VMEM=0.90; _VLEN=8192; _BATCH=2; _ACCUM=32
+else
+  GPU_TIER="small (<=24GB, e.g. L4)"; _VMEM=0.85; _VLEN=4096; _BATCH=1; _ACCUM=64
+fi
+export VLLM_GPU_MEM="${VLLM_GPU_MEM:-$_VMEM}"  # vLLM pair-gen GPU fraction
+export VLLM_MAX_LEN="${VLLM_MAX_LEN:-$_VLEN}"  # vLLM context budget
+export TRAIN_BATCH="${TRAIN_BATCH:-$_BATCH}"   # per-device train batch
+export GRAD_ACCUM="${GRAD_ACCUM:-$_ACCUM}"     # accumulation (effective batch = BATCH*ACCUM = 64)
+echo "[config] gpu=${GPU_MEM_MB}MB tier=${GPU_TIER}; vllm_mem=${VLLM_GPU_MEM} vllm_len=${VLLM_MAX_LEN} batch=${TRAIN_BATCH} accum=${GRAD_ACCUM}"
+
 mkdir -p "${WORK}" "${PAIRS_DIR}" "${TRAIN_OUT}" "${EVAL_DIR}" "${AGG_DIR}" "${CFG_DIR}"
 
 echo "[config] repo=${REPO_ROOT}"

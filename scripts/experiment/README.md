@@ -61,6 +61,10 @@ import os; os.environ["HF_TOKEN"] = "hf_..."   # a token for the gated Llama lic
    judging. The full `all` run is many thousands of generations plus three LoRA
    trainings — realistically an A100-class GPU and hours, not a free T4 session.
    The `MAX_CANDIDATES=20` smoke path is what fits a small session.
+   GPU memory settings are **auto-detected** in `config.sh` (an L4/24GB card gets
+   conservative vLLM + batch settings, an A100 gets the full ones) and the
+   effective training batch is held constant across cards, so you don't tune
+   anything by hand.
 7. **Not run here.** These were authored against the code but not executed in
    this environment (no GPU libs). Run the smoke path first and watch stage 1
    actually accept a few pairs before launching the full job.

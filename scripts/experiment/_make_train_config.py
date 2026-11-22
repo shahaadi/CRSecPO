@@ -21,6 +21,10 @@ template.update({
     # Overridden on the CLI per stage, but must be present and valid here.
     "data_file": str(Path(os.environ["FROZEN_DIR"]) / "train_pairs.jsonl"),
     "output_dir": os.environ["TRAIN_OUT"],
+    # Auto-tuned for the detected GPU (set in config.sh). Effective batch is kept
+    # constant (batch * accum = 64), so the optimization is unchanged across cards.
+    "per_device_train_batch_size": int(os.environ["TRAIN_BATCH"]),
+    "gradient_accumulation_steps": int(os.environ["GRAD_ACCUM"]),
     # ---- validation-based best-checkpoint selection (comparable across arms) ----
     "eval_data_file": str(Path(os.environ["PAIRS_DIR"]) / "validation_pairs.jsonl"),
     "eval_strategy": "steps",
