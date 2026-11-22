@@ -15,6 +15,12 @@ import torch.nn.functional as F
 
 from .constants import IGNORE_INDEX
 
+# Sequence positions processed per log_softmax call. log_softmax is independent
+# per position, so chunking the sequence is numerically identical to the full
+# computation while bounding the [batch, chunk, vocab] intermediate -- the
+# allocation that OOMs when four forward passes run over long sequences.
+_LOGP_SEQUENCE_CHUNK = 512
+
 
 
 @dataclass(frozen=True)
@@ -77,13 +83,20 @@ def sequence_logps(
     ):
         raise ValueError("labels contain a token id outside the logits vocabulary")
 
-    # Memory-efficient per-token log-probability: gather the label's logit and
-    # subtract the log-partition. Mathematically identical to
-    # ``log_softmax(logits).gather(label)`` but avoids materializing the full
-    # [batch, sequence, vocabulary] softmax tensor -- the dominant allocation,
-    # and what OOMs on 24 GB GPUs given four forward passes over long sequences.
-    selected = shifted_logits.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-    token_logps = selected - torch.logsumexp(shifted_logits, dim=-1)
+    # Compute per-token log-probabilities a sequence chunk at a time. This keeps
+    # the exact log_softmax path (so autocast still upcasts it to fp32, unlike a
+    # plain logsumexp) but caps the [batch, chunk, vocab] softmax tensor instead
+    # of materializing the full [batch, sequence, vocab] one, which OOMs 24 GB
+    # GPUs across four forward passes. Chunking is numerically identical because
+    # log_softmax is independent per position.
+    chunks = []
+    for start in range(0, shifted_logits.shape[1], _LOGP_SEQUENCE_CHUNK):
+        piece = shifted_logits[:, start:start + _LOGP_SEQUENCE_CHUNK, :]
+        piece_labels = safe_labels[:, start:start + _LOGP_SEQUENCE_CHUNK].unsqueeze(-1)
+        chunks.append(
+            F.log_softmax(piece, dim=-1).gather(dim=-1, index=piece_labels).squeeze(-1)
+        )
+    token_logps = torch.cat(chunks, dim=1)
     return token_logps.masked_fill(~response_mask, 0.0).sum(dim=-1)
 
 
