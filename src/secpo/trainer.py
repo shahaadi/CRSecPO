@@ -154,3 +154,50 @@ class SecPOTrainer(Trainer):
             "chosen_rewards": output.chosen_rewards,
             "rejected_rewards": output.rejected_rewards,
         }
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: dict[str, torch.Tensor],
+        prediction_loss_only: bool,
+        ignore_keys: Any = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Evaluate one validation batch for best-checkpoint selection.
+
+        Reports the mean SecPO loss and, per example, the implicit reward margin
+        ``chosen_reward - rejected_reward``. A positive margin means the policy
+        ranks the safe (chosen) response above the unsafe (rejected) one, as the
+        objective intends; :func:`secpo_preference_metrics` turns the batch of
+        margins into an interpretable preference accuracy. No tokens are
+        generated: both fixed responses are scored under the current policy.
+        """
+
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            output = self.compute_secpo_output(model, inputs)
+            loss = output.losses.mean().detach()
+        if prediction_loss_only:
+            return (loss, None, None)
+        margins = (output.chosen_rewards - output.rejected_rewards).detach()
+        return (loss, margins, torch.ones_like(margins))
+
+
+def secpo_preference_metrics(eval_prediction: Any) -> dict[str, float]:
+    """Validation metrics for SecPO: preference accuracy and mean reward margin.
+
+    ``preference_accuracy`` is the fraction of held-out pairs whose implicit
+    reward margin is positive -- i.e. where the policy prefers the safe response.
+    It is less sensitive than eval loss to the absolute scale of the margin
+    (which the sigmoid objective can keep inflating), so it is the more reliable
+    quantity to select the best checkpoint on (greater is better).
+    """
+
+    import numpy as np
+
+    margins = np.asarray(eval_prediction.predictions).reshape(-1).astype("float64")
+    if margins.size == 0:
+        return {"preference_accuracy": 0.0, "reward_margin": 0.0}
+    return {
+        "preference_accuracy": float((margins > 0.0).mean()),
+        "reward_margin": float(margins.mean()),
+    }

@@ -1,32 +1,73 @@
 {
-  "accepted_by_split_group": {
+  "by_split_group": {
     "test": {
-      "benign_adversarial_control": 6,
-      "harmful_benign_framing": 18
+      "benign_adversarial_control": 361,
+      "harmful_benign_framing": 242
     },
     "train": {
-      "benign_adversarial_control": 1639,
-      "harmful_benign_framing": 1077
+      "benign_adversarial_control": 1263,
+      "harmful_benign_framing": 845
     },
     "validation": {
-      "benign_adversarial_control": 159,
-      "harmful_benign_framing": 113
+      "benign_adversarial_control": 180,
+      "harmful_benign_framing": 121
+    }
+  },
+  "by_split_pool": {
+    "test": {
+      "evaluation": 24,
+      "training": 579
+    },
+    "train": {
+      "training": 2108
+    },
+    "validation": {
+      "training": 301
     }
   },
   "counts": {
-    "quarantine": 260797,
+    "test": 603,
+    "train": 2108,
+    "validation": 301
+  },
+  "families": {
+    "test": 575,
+    "train": 2017,
+    "validation": 290
+  },
+  "file_sha256": {
+    "test": "78496dc0f1fb4523af4d5598a023ef1fb9a7d5cc6cdf7171f9e0a9fb745867af",
+    "train": "df3ece8b5caa47fc4f20e7be0386bef73cf18d9047578974326c0df9fb4068e5",
+    "validation": "ad21ddd61869302bb957c7ad5e2a36a58e0ceb9580ff8a1a8bd84a0c83c1d6f4"
+  },
+  "leakage_check": {
+    "family_source_target_normalized_cross_split_overlaps": 0
+  },
+  "resplit": {
+    "method": "family-disjoint stratified random re-split of the concatenated preview pairs",
+    "note": "Each prompt type is split 70/10/20 overall; whole families (near-duplicate clusters of one prompt) stay in a single split to prevent train/test leakage.",
+    "pool_rule": "evaluation-pool (held-out) rows are always assigned to test; train and validation are 100% training-pool so the protocol's eval-provenance-in-training guard passes. The 24 eval rows form part of the 20% test.",
+    "ratios": {
+      "test": 0.2,
+      "train": 0.7,
+      "validation": 0.1
+    },
+    "salt": "crsecpo-preview-resplit-v1",
+    "seed": 42,
+    "stratified_by": [
+      "selection_group",
+      "target_policy"
+    ],
+    "unit": "family_id"
+  },
+  "schema_version": 2,
+  "selection_status_counts": {
+    "accepted": 3012
+  },
+  "source_counts": {
     "test": 24,
+    "total": 3012,
     "train": 2716,
     "validation": 272
-  },
-  "eval_master_sha256": "810064ab40252391e803a43cec14da8a31f1597fc93ba34d6371139794997112",
-  "schema_version": 1,
-  "seed": 42,
-  "selection_status_counts": {
-    "accepted": 3012,
-    "rejected": 260797
-  },
-  "total_assignments": 263809,
-  "train_master_sha256": "749869187ccc91bd4b347d08c8f6c0efb371cb91386efc3d054fc321369a37ef",
-  "validation_fraction": 0.1
+  }
 }

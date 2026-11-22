@@ -60,17 +60,20 @@ def _required_text(row: Mapping[str, Any], key: str) -> str:
     return value
 
 
-def _validate_training_row(row, config, tokenizer, collator):
+def _validate_training_row(row, config, tokenizer, collator, *, expected_split="train"):
     if not isinstance(row, dict):
         raise PreferenceSchemaError("each pair must be an object")
     row_id = _required_text(row, "id")
-    if row.get("split") != "train":
-        raise PreferenceSchemaError(f"pair {row_id}: split must be train; final-test ingestion is forbidden")
+    if row.get("split") != expected_split:
+        raise PreferenceSchemaError(
+            f"pair {row_id}: split must be {expected_split}; final-test ingestion is forbidden")
     from .pairs import validate_candidate
     try:
+        # train and validation both live in the training pool (partition "train");
+        # the held-out evaluation pool must never enter either.
         validate_candidate(row)
         if row["provenance"].get("publisher_partition") != "train":
-            raise ValueError("final-test/evaluation source provenance is forbidden in training")
+            raise ValueError("final-test/evaluation source provenance is forbidden in train/validation")
     except (ValueError, TypeError) as error:
         raise PreferenceSchemaError(f"pair {row_id}: invalid training candidate: {error}") from error
     metadata = row.get("pair_metadata")
@@ -275,13 +278,49 @@ def build_trainer(config: Any, method: str, *, tokenizer: Any = None) -> tuple[A
     if any(parameter.requires_grad for name, parameter in policy.named_parameters()
            if "lora_" not in name):
         raise ValueError("all non-LoRA base parameters must remain frozen")
+    eval_dataset = None
+    if getattr(config, "eval_data_file", None) is not None:
+        eval_dataset = _prepare_eval_dataset(config, method, tokenizer, collator)
     trainer_class = Trainer if method == "sft" else SecPOTrainer
     kwargs = {} if method == "sft" else {"beta": config.beta}
+    if method != "sft" and eval_dataset is not None:
+        # SecPO reports preference accuracy on validation; plain-Trainer SFT keeps eval_loss.
+        from ..trainer import secpo_preference_metrics
+        kwargs["compute_metrics"] = secpo_preference_metrics
     trainer = trainer_class(model=policy, args=training_args,
-                            train_dataset=Dataset.from_list(rows), data_collator=collator,
-                            processing_class=tokenizer, **kwargs)
+                            train_dataset=Dataset.from_list(rows), eval_dataset=eval_dataset,
+                            data_collator=collator, processing_class=tokenizer, **kwargs)
     manifest["training_config"] = asdict(config)
     return trainer, tokenizer, manifest
+
+
+def _prepare_eval_dataset(config: Any, method: str, tokenizer: Any, collator: Any):
+    """Validate the held-out validation pairs for best-checkpoint selection.
+
+    Validation pairs must carry ``split='validation'`` and training-pool
+    provenance; the final-test (evaluation pool) can never enter here.
+    """
+    from datasets import Dataset
+    path = Path(config.eval_data_file).expanduser()
+    payload = read_collection_export(path, "pairs")
+    rows = _read_json_records(path, payload=payload)
+    if not rows:
+        raise PreferenceSchemaError("validation pair file is empty")
+    seen, errors = set(), []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise PreferenceSchemaError("each pair must be an object")
+        row_id = _required_text(row, "id")
+        if row_id in seen:
+            raise PreferenceSchemaError(f"duplicate validation pair id: {row_id}")
+        seen.add(row_id)
+        try:
+            _validate_training_row(row, config, tokenizer, collator, expected_split="validation")
+        except PreferenceSchemaError as error:
+            errors.append(str(error))
+    if errors:
+        raise PreferenceSchemaError("validation preparation failed (no rows removed):\n" + "\n".join(errors))
+    return Dataset.from_list(rows)
 
 
 def _run_identity(manifest: Mapping[str, Any]) -> dict:
@@ -289,7 +328,7 @@ def _run_identity(manifest: Mapping[str, Any]) -> dict:
     identity = dict(manifest)
     identity.pop("input_path", None)
     config = dict(identity.get("training_config", {}))
-    for name in ("output_dir", "data_file"):
+    for name in ("output_dir", "data_file", "eval_data_file"):
         config.pop(name, None)
     identity["training_config"] = config
     return json.loads(json.dumps(identity, sort_keys=True))

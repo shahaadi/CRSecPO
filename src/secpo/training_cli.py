@@ -22,7 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 
 from .data import BenignReferenceCollator, load_preference_dataset
 from .online_training import FileAttackExchange, OnlineAttackCollator
-from .trainer import SecPOTrainer
+from .trainer import SecPOTrainer, secpo_preference_metrics
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,16 @@ class SecPOTrainingConfig:
     save_strategy: str
     report_to: str
     save_steps: int = 500
+    save_total_limit: int | None = None
+    # Validation-based checkpoint selection. Defaults keep the historical
+    # single-split behaviour (no evaluation, final checkpoint kept).
+    eval_data_file: str | None = None
+    eval_strategy: str = "no"
+    eval_steps: int = 500
+    per_device_eval_batch_size: int | None = None
+    load_best_model_at_end: bool = False
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
     max_prompt_length: int | None = None
     seed: int = 42
     data_seed: int | None = None
@@ -242,6 +252,42 @@ def parse_training_config(raw: dict[str, Any]) -> SecPOTrainingConfig:
         raise ValueError("save_strategy must be one of: no, steps, epoch")
     if "save_steps" in values:
         _positive_int("save_steps", values["save_steps"])
+    if values.get("save_total_limit") is not None:
+        _positive_int("save_total_limit", values["save_total_limit"])
+
+    if values.get("eval_data_file") is not None:
+        if not isinstance(values["eval_data_file"], str) or not values["eval_data_file"].strip():
+            raise ValueError("eval_data_file must be a non-empty string or null")
+        values["eval_data_file"] = values["eval_data_file"].strip()
+    if values.get("eval_strategy", "no") not in {"no", "steps", "epoch"}:
+        raise ValueError("eval_strategy must be one of: no, steps, epoch")
+    if "eval_steps" in values:
+        _positive_int("eval_steps", values["eval_steps"])
+    if values.get("per_device_eval_batch_size") is not None:
+        _positive_int("per_device_eval_batch_size", values["per_device_eval_batch_size"])
+    for name in ("load_best_model_at_end", "greater_is_better"):
+        if name in values and type(values[name]) is not bool:
+            raise ValueError(f"{name} must be a boolean")
+    if "metric_for_best_model" in values and (
+        not isinstance(values["metric_for_best_model"], str) or not values["metric_for_best_model"].strip()
+    ):
+        raise ValueError("metric_for_best_model must be a non-empty string")
+
+    eval_strategy = values.get("eval_strategy", "no")
+    save_strategy = values["save_strategy"]
+    if eval_strategy != "no" and values.get("eval_data_file") is None:
+        raise ValueError("eval_strategy requires an eval_data_file holding the validation pairs")
+    if values.get("load_best_model_at_end"):
+        if eval_strategy == "no":
+            raise ValueError("load_best_model_at_end requires eval_strategy 'steps' or 'epoch'")
+        if save_strategy != eval_strategy:
+            raise ValueError("load_best_model_at_end requires save_strategy to equal eval_strategy")
+        if eval_strategy == "steps":
+            save_steps = values.get("save_steps", 500)
+            eval_steps = values.get("eval_steps", 500)
+            if save_steps % eval_steps != 0:
+                raise ValueError("load_best_model_at_end requires save_steps to be a multiple of eval_steps")
+
     if values["report_to"] != "none":
         raise ValueError(
             "report_to must be 'none' in the clean release; external "
@@ -418,9 +464,14 @@ def _filter_prompt_budget(
 
 
 def _build_training_arguments(config: SecPOTrainingConfig) -> TrainingArguments:
-    """Build Trainer arguments, keeping model-specific data controls explicit."""
+    """Build Trainer arguments, keeping model-specific data controls explicit.
 
-    return TrainingArguments(
+    Validation-selection arguments are added only when a run opts in
+    (``eval_strategy != "no"``). With the released single-split configs the
+    returned arguments are therefore identical to the original SecPO setup.
+    """
+
+    arguments: dict[str, Any] = dict(
         output_dir=config.output_dir,
         learning_rate=config.learning_rate,
         per_device_train_batch_size=config.per_device_train_batch_size,
@@ -439,6 +490,7 @@ def _build_training_arguments(config: SecPOTrainingConfig) -> TrainingArguments:
         logging_steps=config.logging_steps,
         save_strategy=config.save_strategy,
         save_steps=config.save_steps,
+        save_total_limit=config.save_total_limit,
         report_to="none",
         remove_unused_columns=False,
         ddp_find_unused_parameters=config.ddp_find_unused_parameters,
@@ -447,6 +499,20 @@ def _build_training_arguments(config: SecPOTrainingConfig) -> TrainingArguments:
         dataloader_drop_last=config.dataloader_drop_last,
         max_steps=config.max_steps,
     )
+    if config.eval_strategy != "no" or config.load_best_model_at_end:
+        arguments.update(
+            eval_strategy=config.eval_strategy,
+            eval_steps=config.eval_steps,
+            per_device_eval_batch_size=(
+                config.per_device_eval_batch_size
+                if config.per_device_eval_batch_size is not None
+                else config.per_device_train_batch_size
+            ),
+            load_best_model_at_end=config.load_best_model_at_end,
+            metric_for_best_model=config.metric_for_best_model,
+            greater_is_better=config.greater_is_better,
+        )
+    return TrainingArguments(**arguments)
 
 
 def build_trainer(config: SecPOTrainingConfig) -> tuple[SecPOTrainer, Any]:
@@ -464,6 +530,13 @@ def build_trainer(config: SecPOTrainingConfig) -> tuple[SecPOTrainer, Any]:
         tokenizer,
         config.max_prompt_length,
     )
+    eval_dataset = None
+    if config.eval_data_file is not None:
+        eval_dataset = _filter_prompt_budget(
+            load_preference_dataset(config.eval_data_file),
+            tokenizer,
+            config.max_prompt_length,
+        )
 
     training_args = _build_training_arguments(config)
     collator: Any = BenignReferenceCollator(
@@ -490,8 +563,10 @@ def build_trainer(config: SecPOTrainingConfig) -> tuple[SecPOTrainer, Any]:
         model=policy,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         data_collator=collator,
         processing_class=tokenizer,
+        compute_metrics=secpo_preference_metrics if eval_dataset is not None else None,
         beta=config.beta,
     )
     return trainer, tokenizer
