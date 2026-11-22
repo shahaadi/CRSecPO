@@ -1,50 +1,26 @@
 """Optional OpenAI chat judge for CRSecPO evaluation grading.
 
 A drop-in judge backend: given the blinded grading request it calls a (cheap)
-OpenAI chat model in strict JSON-schema mode and returns the grade exactly as the
-local judge would (``prohibited_assistance`` / ``refusal`` / ``permitted_help`` /
-``rationale``). The API key is read from the OPENAI_API_KEY environment variable;
-it is never written to configs, journals, or code.
+OpenAI chat model and returns the grade exactly as the local judge would
+(``prohibited_assistance`` / ``refusal`` / ``permitted_help`` / ``rationale``).
+The API key is read from the OPENAI_API_KEY environment variable; it is never
+written to configs, journals, or code.
 
-Grading is journaled by the caller, so if the run stops on a quota or rate error,
-re-running resumes and the already-completed grades are replayed without being
-re-charged. Transient rate/connection errors are retried here with exponential
-backoff so they don't halt the whole run.
+Compatible with reasoning models (e.g. gpt-5-mini): it uses ``max_completion_tokens``
+with generous headroom for hidden reasoning tokens, requests a plain JSON object
+(the prompt pins the exact fields; parse_grade validates them), and sends no
+``temperature``/``seed`` (reasoning models reject non-default temperature). Grading
+is journaled by the caller, so a run that stops on a quota/rate error resumes and
+the completed grades are replayed without being re-charged; transient rate or
+connection errors are retried here with exponential backoff.
 """
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
 import os
 import time
 
 SCHEMA_VERSION = "crsecpo-openai-judge-v1"
-
-# Strict schema so the model must return exactly the fields parse_grade expects.
-_GRADE_SCHEMA = {
-    "name": "crsecpo_grade",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "prohibited_assistance": {"type": ["boolean", "null"]},
-            "refusal": {"type": ["boolean", "null"]},
-            "permitted_help": {"type": ["boolean", "null"]},
-            "rationale": {"type": "string"},
-        },
-        "required": ["prohibited_assistance", "refusal", "permitted_help", "rationale"],
-    },
-}
-
-
-class _StubTokenizer:
-    """Deterministic chat rendering so request hashes are stable (no model)."""
-
-    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
-        if tokenize or not add_generation_prompt:
-            raise ValueError("unexpected chat-template arguments for the OpenAI judge")
-        return json.dumps(messages, ensure_ascii=False, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -59,10 +35,20 @@ class _OpenAIJudgeSpec:
         return asdict(self)
 
 
+class _StubTokenizer:
+    """Deterministic chat rendering so request hashes are stable (no model)."""
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        if tokenize or not add_generation_prompt:
+            raise ValueError("unexpected chat-template arguments for the OpenAI judge")
+        import json
+        return json.dumps(messages, ensure_ascii=False, sort_keys=True)
+
+
 class OpenAIJudgeBackend:
     """Judge backend that grades via an OpenAI chat model instead of a local LM."""
 
-    def __init__(self, model, *, temperature=0.0, max_tokens=512, max_retries=6, base_delay=2.0):
+    def __init__(self, model, *, max_completion_tokens=4096, max_retries=6, base_delay=2.0):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("OpenAI judge requires a non-empty model name")
         if not os.environ.get("OPENAI_API_KEY"):
@@ -73,13 +59,11 @@ class OpenAIJudgeBackend:
         except ImportError as error:  # pragma: no cover - optional dependency
             raise ImportError("the OpenAI judge requires the 'openai' package (pip install openai)") from error
         self.model = model.strip()
-        self.temperature = float(temperature)
-        self.max_tokens = int(max_tokens)
+        self.max_completion_tokens = int(max_completion_tokens)
         self.max_retries = int(max_retries)
         self.base_delay = float(base_delay)
         identity = {"schema_version": SCHEMA_VERSION, "provider": "openai",
-                    "model": self.model, "temperature": self.temperature,
-                    "response_format": "json_schema", "grade_schema": _GRADE_SCHEMA}
+                    "model": self.model, "response_format": "json_object"}
         self.spec = _OpenAIJudgeSpec(provider="openai", model=self.model)
         self.tokenizer = _StubTokenizer()
         self.fingerprint = identity
@@ -94,10 +78,8 @@ class OpenAIJudgeBackend:
                 completion = self._client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    response_format={"type": "json_schema", "json_schema": _GRADE_SCHEMA},
-                    seed=request.get("seed"),
+                    max_completion_tokens=self.max_completion_tokens,
+                    response_format={"type": "json_object"},
                 )
             except (openai.RateLimitError, openai.APITimeoutError,
                     openai.APIConnectionError, openai.InternalServerError) as error:

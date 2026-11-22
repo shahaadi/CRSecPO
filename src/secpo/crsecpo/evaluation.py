@@ -958,10 +958,10 @@ def _backend_from_config(config: Mapping[str, Any], *, judge: bool = False):
         if provider != "openai":
             raise ValueError(f"unsupported judge provider: {provider!r}")
         from .openai_judge import OpenAIJudgeBackend
-        gen = config.get("judge_generation", {})
-        return OpenAIJudgeBackend(config[key]["model"],
-                                  temperature=gen.get("temperature", 0.0),
-                                  max_tokens=gen.get("max_new_tokens", 512))
+        # The adapter uses its own generous max_completion_tokens (room for a
+        # reasoning model's hidden tokens); the local judge_generation sizes do
+        # not apply to an API model.
+        return OpenAIJudgeBackend(config[key]["model"])
     spec = ModelSpec(**config[key])
     options = {"device": config.get("judge_device" if judge else "device", "cpu"),
                "dtype": config.get("dtype", "auto")}
