@@ -12,7 +12,7 @@ No model is loaded and no answers are generated. Env in: PAIRS_DIR.
 import json, os
 from pathlib import Path
 
-from secpo.crsecpo.collection_exports import read_collection_export, write_standalone_export
+from secpo.crsecpo.collection_exports import write_standalone_export
 from secpo.evaluation.sep_judge import load_jsonl
 
 pairs_dir = Path(os.environ["PAIRS_DIR"])
@@ -23,8 +23,10 @@ for name in ("train", "validation"):
         raise SystemExit(
             f"missing {source}; run stage 1 first (both train and validation pairs "
             "must already exist to merge them)")
-    payload = read_collection_export(source, "pairs")   # verifies the export
-    for row in load_jsonl(source, payload=payload):
+    # Read the pair rows directly rather than through read_collection_export: the
+    # small collection sidecars are what Drive sync tends to corrupt, and the
+    # pairs themselves are re-validated at freeze (stage 2).
+    for row in load_jsonl(source):
         if row["id"] in seen:
             raise SystemExit(f"duplicate pair id across splits: {row['id']}")
         seen.add(row["id"])
@@ -32,6 +34,9 @@ for name in ("train", "validation"):
         combined.append(row)
 
 out = pairs_dir / "merged_pairs.jsonl"
-out.unlink(missing_ok=True)
+# Remove the merged file AND any of its (possibly Drive-corrupted) sidecars so
+# the standalone write starts clean.
+for stale in pairs_dir.glob("merged_pairs.jsonl*"):
+    stale.unlink(missing_ok=True)
 write_standalone_export(combined, out)
 print(f"wrote {out} ({len(combined)} pairs: train+validation merged, split=train)")
