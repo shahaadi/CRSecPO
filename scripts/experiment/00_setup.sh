@@ -7,8 +7,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 echo "== Stage 0: setup =="
 
-# Core deps. Add the 'vllm' extra only if you use the vLLM pair backend.
-pip install -q -e "${REPO_ROOT}"
+# Colab already ships a CUDA-matched torch; downgrading it to the repo's exact
+# pins breaks the GPU build (and the latest vLLM needs the newer torch). So
+# install the secpo CODE without forcing its pinned deps, then add its runtime
+# libraries loosely so they match the torch already on the machine.
+pip install -q --upgrade pip
+pip install -q -e "${REPO_ROOT}" --no-deps
+pip install -q "transformers>=5.5" "peft>=0.19" "datasets>=4" "accelerate>=1.1" "safetensors>=0.7"
 if [ "${PAIRS_BACKEND}" = "vllm" ]; then
   pip install -q "vllm" || { echo "vLLM install failed; set PAIRS_BACKEND=hf in config.sh"; exit 1; }
 fi
