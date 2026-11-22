@@ -15,14 +15,32 @@ source "${SCRIPT_DIR}/config.sh"
 echo "== Stage 3: train sft / dpo / crsecpo =="
 python "${SCRIPT_DIR}/_make_train_config.py"
 
-for METHOD in sft dpo crsecpo; do
-  echo "--- training ${METHOD} ---"
+train_method () {  # $1 = method; remaining args passed through (e.g. resume)
+  local m="$1"; shift
   python -m secpo.crsecpo.training \
     --config "${CFG_DIR}/train_experiment.json" \
-    --method "${METHOD}" \
+    --method "${m}" \
     --data-file "${FROZEN_DIR}/train_pairs.jsonl" \
-    --output-dir "${TRAIN_OUT}/${METHOD}"
-  echo "adapter: ${TRAIN_OUT}/${METHOD}"
+    --output-dir "${TRAIN_OUT}/${m}" "$@"
+}
+
+for METHOD in sft dpo crsecpo; do
+  OUT="${TRAIN_OUT}/${METHOD}"
+  # Final adapter at the dir root means this arm already finished -> skip it.
+  if [ -f "${OUT}/adapter_config.json" ]; then
+    echo "--- ${METHOD}: already complete, skipping ---"
+    continue
+  fi
+  # Otherwise resume from the newest saved checkpoint if one exists.
+  latest="$(ls -d "${OUT}"/checkpoint-* 2>/dev/null | sed 's#.*/checkpoint-##' | sort -n | tail -1 || true)"
+  if [ -n "${latest}" ]; then
+    echo "--- ${METHOD}: resuming from checkpoint-${latest} ---"
+    train_method "${METHOD}" --resume-from-checkpoint "${OUT}/checkpoint-${latest}"
+  else
+    echo "--- ${METHOD}: training from scratch ---"
+    train_method "${METHOD}"
+  fi
+  echo "adapter: ${OUT}"
 done
 
 echo "Trained adapters under ${TRAIN_OUT}/{sft,dpo,crsecpo}."
