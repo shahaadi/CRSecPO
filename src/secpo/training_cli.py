@@ -512,6 +512,20 @@ def _build_training_arguments(config: SecPOTrainingConfig) -> TrainingArguments:
             metric_for_best_model=config.metric_for_best_model,
             greater_is_better=config.greater_is_better,
         )
+    # The released pins target one transformers version; when a different one is
+    # installed (e.g. on Colab) its TrainingArguments may have renamed or removed
+    # some fields. Drop any it does not accept and report them, rather than crash.
+    import inspect
+    import transformers
+    accepted = set(inspect.signature(TrainingArguments.__init__).parameters)
+    unsupported = sorted(name for name in arguments if name not in accepted)
+    if unsupported:
+        print(
+            f"[secpo] transformers {transformers.__version__} does not accept "
+            f"{unsupported}; dropping them (check these are not behaviourally important).",
+            flush=True,
+        )
+        arguments = {name: value for name, value in arguments.items() if name in accepted}
     return TrainingArguments(**arguments)
 
 
