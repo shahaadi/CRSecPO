@@ -17,7 +17,7 @@ you get both: working hard links and disconnect-survival, with nothing to do.
 ```bash
 cd scripts/experiment
 bash 00_setup.sh          # install, HF login, download the pinned Llama
-bash 01_generate_pairs.sh # train + validation preference pairs (NOT test)
+bash 01_generate_pairs.sh # preference pairs for merged train+validation (NOT test)
 bash 02_freeze_pairs.sh   # one balanced 50/50 safe-vs-harmful train set
 bash 03_train.sh          # sft, dpo, crsecpo on the SAME frozen pairs
 bash 04_eval_safety.sh    # blinded safety eval on test for base/sft/dpo/crsecpo
@@ -48,14 +48,14 @@ import os; os.environ["HF_TOKEN"] = "hf_..."   # a token for the gated Llama lic
    contrast fails closed because your data has no `control_group="matched"` rows.
    The resulting claim is group-level, which is the right claim for your
    curated counterfactual controls.
-3. **Validation is on and comparable.** All three arms share one config and
-   select the best checkpoint by `eval_loss` — not `eval_preference_accuracy`,
-   because SFT (a plain LM run) can't produce that metric, and the arms must have
-   identical training configs to count as "comparable". (`eval_preference_accuracy`
-   is still available for a *standalone* crsecpo run via
-   `configs/train_crsecpo_llama31_validation.json`.)
-4. **Test never gets pairs.** Pairs are generated for train+validation only;
-   `test.jsonl` is the held-out eval set used in stage 4.
+3. **Full-epoch training, train+validation merged.** There is no validation-based
+   checkpoint selection: each arm trains one full epoch and keeps the end-of-epoch
+   model (periodic step checkpoints remain only for resume). Since validation is
+   unused for selection, stage 1 folds the train and validation splits into one
+   training set (all `split=train`). All three arms share one config (only
+   `--method` differs), so the runs stay comparable.
+4. **Test never gets pairs.** Pairs are generated for the merged train+validation
+   set only; `test.jsonl` is the held-out eval set used in stage 4.
 5. **joint_claim needs more than safety.** `05` computes the safety + over-refusal
    contrasts, but the headline `joint_claim` also needs the two utility contrasts
    (ifeval 541 / gsm8k 400, via `UTILITY="--utility-scores ..."`) and the two

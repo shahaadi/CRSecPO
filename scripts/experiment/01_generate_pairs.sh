@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# Stage 1: generate preference pairs for TRAIN and VALIDATION.
+# Stage 1: generate preference pairs for the TRAIN+VALIDATION set.
 #
+# Full-epoch training uses no validation-based selection, so the train and
+# validation splits are merged into one training set here (test stays held out).
 # For each candidate the model produces an "ordinary" answer (bare framed query)
-# and a "combined" answer (rubric + the vanilla counterfactual in context), then
-# a swapped-order judge decides. Accepted pairs become (chosen=combined,
-# rejected=ordinary). Test is NOT generated here -- it is the held-out eval set.
+# and a "combined" answer (rubric + the vanilla counterfactual in context);
+# judge-free, the pair becomes (chosen=combined, rejected=ordinary).
 #
 # The journal makes this resumable: re-run after an interruption and it continues.
 set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
+# Capture the script dir before config.sh changes the working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 JUDGE_ARG="--no-judge"
 [ "${USE_JUDGE}" = "1" ] && JUDGE_ARG=""
@@ -38,10 +41,10 @@ gen () {  # $1 = split name, $2 = candidates file
     ${JUDGE_ARG}
 }
 
-gen train      "${TRAIN_CANDIDATES}"
-gen validation "${VAL_CANDIDATES}"
+# Merge train + validation into one training candidate set (test stays held out).
+python "${SCRIPT_DIR}/_make_trainval.py"
+gen train "${WORK}/trainval_candidates.jsonl"
 
-echo "Train pairs:      ${PAIRS_DIR}/train_pairs.jsonl"
-echo "Validation pairs: ${PAIRS_DIR}/validation_pairs.jsonl"
-echo "NOTE: acceptance is strict, so accepted pairs << candidates. If a split yields"
-echo "      too few, raise MAX_CANDIDATES in config.sh (use 'all' for the full run)."
+echo "Training pairs (train+validation): ${PAIRS_DIR}/train_pairs.jsonl"
+echo "NOTE: with judge-free acceptance, accepted pairs ~= candidates whose two"
+echo "      answers differ. If too few, raise MAX_CANDIDATES in config.sh ('all')."
