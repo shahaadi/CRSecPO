@@ -21,8 +21,8 @@ bash 01_generate_pairs.sh # train + validation preference pairs (NOT test); repl
 bash reuse_pairs.sh       # fold train+validation pairs into one set (no regeneration)
 bash 02_freeze_pairs.sh   # one balanced 50/50 safe-vs-harmful train set
 bash 03_train.sh          # sft, dpo, crsecpo on the SAME frozen pairs
-bash 04_eval_safety.sh    # blinded safety eval on test for base/sft/dpo/crsecpo
-bash 05_aggregate.sh      # contrasts + decision (over-refusal switch flipped)
+bash 04_eval_safety.sh    # blinded safety eval on test (vLLM-batched gen + concurrent grading)
+bash 05_aggregate.sh      # contrasts + decision, PRINTED in the cell (over-refusal switch flipped)
 ```
 
 `01` writes `train_pairs.jsonl` and `validation_pairs.jsonl`; re-running it with
@@ -38,10 +38,17 @@ the compute knobs, and is sourced by all stages.
 ```python
 !git clone <your-repo-url> CRSecPO && cd CRSecPO && git checkout crsecpo-preview-splits
 import os; os.environ["HF_TOKEN"] = "hf_..."   # a token for the gated Llama license
+# Optional: grade stage 4 with a cheap OpenAI model instead of the local 8B judge.
+# Put the key in Colab Secrets (left sidebar, key icon) as OPENAI_API_KEY, then:
+from google.colab import userdata
+os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")  # never written to disk
+os.environ["OPENAI_JUDGE_MODEL"] = "gpt-5-mini"                 # a cheap reasoning-capable model
 !cd CRSecPO/scripts/experiment && bash 00_setup.sh
 # run MAX_CANDIDATES=20 first to prove the pipeline, then set it to 'all':
 !cd CRSecPO/scripts/experiment && MAX_CANDIDATES=20 bash 01_generate_pairs.sh
 !cd CRSecPO/scripts/experiment && bash reuse_pairs.sh && bash 02_freeze_pairs.sh && bash 03_train.sh
+# Foreground: generation is vLLM-batched and grading runs concurrently, so this is
+# fast enough to watch; stage 5 prints the decision right below the cell.
 !cd CRSecPO/scripts/experiment && bash 04_eval_safety.sh && bash 05_aggregate.sh
 ```
 
@@ -79,6 +86,22 @@ import os; os.environ["HF_TOKEN"] = "hf_..."   # a token for the gated Llama lic
    conservative vLLM + batch settings, an A100 gets the full ones) and the
    effective training batch is held constant across cards, so you don't tune
    anything by hand.
-7. **Not run here.** These were authored against the code but not executed in
+7. **Fast eval = vLLM generation + concurrent grading.** `config.sh` ships
+   `EVAL_BACKEND=vllm`, so stage 4 batches every test prompt through one vLLM
+   engine per checkpoint (base loads the bare model; sft/dpo/crsecpo apply their
+   LoRA through vLLM's adapter support) instead of generating one prompt at a
+   time. If you set an `OPENAI_JUDGE_MODEL`, the grades are also issued
+   concurrently (8 in flight). Set `EVAL_BACKEND=hf` to fall back to the exact
+   sequential HF engine. The two engines are numerically different, so each keeps
+   its own per-checkpoint journal/identity — switching engines starts fresh rather
+   than mixing cached generations. `EVAL_BATCH_SIZE` (default 128) controls how
+   often the journal flushes so a disconnect loses at most one chunk.
+8. **The OpenAI judge resumes and is never double-charged.** Grading is journaled:
+   if your quota runs out mid-grade, completed grades are replayed on re-run and
+   only the missing ones are retried (a persistent failure aborts the stage with a
+   "re-run to resume" message rather than finalizing half-graded). The key is read
+   only from `OPENAI_API_KEY` in the environment and never written to a config or
+   journal. Leave `OPENAI_JUDGE_MODEL` empty to use the local 8B judge instead.
+9. **Not run here.** These were authored against the code but not executed in
    this environment (no GPU libs). Run the smoke path first and watch stage 1
    actually accept a few pairs before launching the full job.

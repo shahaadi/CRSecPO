@@ -561,7 +561,8 @@ class VLLMBackend:
     ``backend_identity`` so journals and caches never mix the two engines.
     """
     def __init__(self, spec: ModelSpec, *, dtype: str = "bfloat16", max_model_len: int = 8192,
-                 gpu_memory_utilization: float = 0.9, identity=None):
+                 gpu_memory_utilization: float = 0.9, identity=None,
+                 extra_llm_kwargs=None, identity_extra=None):
         from transformers import AutoConfig
         if (Path(spec.model_id) / "adapter_config.json").exists():
             raise ValueError("pair inference requires a frozen base model, not an adapter")
@@ -577,9 +578,17 @@ class VLLMBackend:
                                                  local_files_only=True, trust_remote_code=False)
         self.model_type = getattr(self.config, "model_type", None)
         expected = self.identity_for(spec, dtype=dtype, max_model_len=max_model_len)
+        # A subclass (e.g. a frozen LoRA adapter) folds its own evidence into the
+        # engine identity so journals/caches never mix it with the bare base engine.
+        if identity_extra is not None:
+            expected = {**expected, **identity_extra}
         if identity is not None and identity != expected:
             raise ValueError("vLLM backend identity differs from the recorded collection identity")
         self.identity = expected
+        # Evaluation (_request) stamps backend_identity from .fingerprint; mirror the
+        # engine identity there so requests validate and journals stay per-engine.
+        self.fingerprint = expected
+        self._lora_request = None
         self.sampling_defaults = expected["sampling_defaults"]
         eos = self._generation_config(spec).eos_token_id
         if eos is None:
@@ -599,7 +608,7 @@ class VLLMBackend:
                        gpu_memory_utilization=gpu_memory_utilization, trust_remote_code=False,
                        # Never let vLLM merge generation_config.json defaults on its own;
                        # every sampling value is passed explicitly below.
-                       generation_config="vllm")
+                       generation_config="vllm", **(extra_llm_kwargs or {}))
 
     @staticmethod
     def load_tokenizer(spec):
@@ -698,8 +707,12 @@ class VLLMBackend:
                 results[index] = error
         if prepared:
             try:
+                # Only pass lora_request when an adapter is attached, so the bare base
+                # engine calls generate() exactly as before (no LoRA machinery).
+                lora_kwargs = {"lora_request": self._lora_request} if self._lora_request is not None else {}
                 outputs = self.llm.generate([TokensPrompt(prompt_token_ids=ids) for _, ids, _ in prepared],
-                                            [params for _, _, params in prepared], use_tqdm=False)
+                                            [params for _, _, params in prepared], use_tqdm=False,
+                                            **lora_kwargs)
             except Exception as error:
                 # Older vLLM runtimes may not expose the V1 exception type.
                 try:
@@ -782,3 +795,50 @@ class AdapterBackend(HFBackend):
     def _validate_backend_identity(self, request):
         if request.get("backend_identity") != self.fingerprint:
             raise ValueError("request is missing or mismatches immutable adapter identity")
+
+
+def _validate_adapter_against_base(spec, adapter_path, *, expected_adapter_sha256):
+    """Shared adapter provenance guard (base revision/model, content digest)."""
+    adapter_path = Path(adapter_path).resolve(strict=True)
+    adapter_sha256 = adapter_content_sha256(adapter_path)
+    if expected_adapter_sha256 is not None and adapter_sha256 != expected_adapter_sha256:
+        raise ValueError("local adapter content differs from expected immutable digest")
+    adapter_config = json.loads((adapter_path / "adapter_config.json").read_text())
+    if adapter_config.get("revision") not in {None, spec.model_revision}:
+        raise ValueError("adapter base revision differs from pinned base revision")
+    adapter_base = adapter_config.get("base_model_name_or_path")
+    if adapter_base and adapter_base != spec.model_id:
+        if not (Path(adapter_base).is_dir() and Path(spec.model_id).is_dir()
+                and Path(adapter_base).resolve() == Path(spec.model_id).resolve()):
+            raise ValueError("adapter base model differs from pinned base model")
+    return adapter_path, adapter_sha256, adapter_config
+
+
+class VLLMAdapterBackend(VLLMBackend):
+    """Evaluation-only batched vLLM backend with a frozen LoRA adapter.
+
+    Same batched engine as VLLMBackend, but the trained LoRA is applied through
+    vLLM's native adapter support. The adapter's content digest is folded into the
+    engine identity (and fingerprint), so its journals/caches never mix with the
+    bare base engine, another adapter, or the HF AdapterBackend (whose sampler is
+    numerically different). Base weights stay frozen and pinned; only the adapter
+    differs from VLLMBackend.
+    """
+    def __init__(self, spec: ModelSpec, adapter_path, *, dtype: str = "bfloat16",
+                 max_model_len: int = 8192, gpu_memory_utilization: float = 0.9,
+                 expected_adapter_sha256: str | None = None):
+        adapter_path, adapter_sha256, adapter_config = _validate_adapter_against_base(
+            spec, adapter_path, expected_adapter_sha256=expected_adapter_sha256)
+        rank = adapter_config.get("r")
+        if not isinstance(rank, int) or isinstance(rank, bool) or rank < 1:
+            raise ValueError("adapter_config.json must declare a positive LoRA rank 'r'")
+        self._adapter_path = str(adapter_path)
+        super().__init__(spec, dtype=dtype, max_model_len=max_model_len,
+                         gpu_memory_utilization=gpu_memory_utilization,
+                         extra_llm_kwargs={"enable_lora": True, "max_loras": 1, "max_lora_rank": rank},
+                         identity_extra={"adapter": {"schema_version": "crsecpo-local-adapter-v1",
+                                                     "adapter_sha256": adapter_sha256}})
+        from vllm.lora.request import LoRARequest
+        self._lora_request = LoRARequest("crsecpo_eval_adapter", 1, self._adapter_path)
+        if adapter_content_sha256(adapter_path) != adapter_sha256:
+            raise ValueError("adapter contents changed while loading")

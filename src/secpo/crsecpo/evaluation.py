@@ -170,10 +170,57 @@ def _claim_evaluation_protocol(destination, protocol, *additional_artifacts):
     return protocol_path
 
 
+def _journaled_responses(journal, requests, *, batch_size=None):
+    """Resolve each request to its journaled response (or None if it failed).
+
+    Uses the backend's batched ``generate_many`` when available (vLLM generation,
+    concurrent OpenAI grading); otherwise one call at a time. Completed responses
+    are replayed from the journal and duplicate requests are resolved once, so this
+    is resumable and never re-generates or re-charges finished work. ``batch_size``
+    caps how many uncached requests go to the engine (and thus the journal) at once,
+    so progress flushes periodically and a mid-run crash loses at most one chunk.
+    """
+    responses = [None] * len(requests)
+    pending, where = {}, {}
+    for index, request in enumerate(requests):
+        cached = journal.completed(request)
+        if cached is not None:
+            responses[index] = cached
+            continue
+        key = json.dumps(request, sort_keys=True, ensure_ascii=False)
+        where.setdefault(key, []).append(index)
+        pending.setdefault(key, request)
+    if pending:
+        batch = list(pending.values())
+        step = len(batch) if not batch_size or batch_size < 1 else int(batch_size)
+        batched = hasattr(journal.backend, "generate_many")
+        for start in range(0, len(batch), step):
+            chunk = batch[start:start + step]
+            if batched:
+                # Per-request failures are journaled (not raised); resolved below.
+                journal.record_batch(chunk, journal.backend.generate_many)
+            else:
+                for request in chunk:
+                    journal(request)  # sequential: raises on failure; resume replays completed, retries this one
+        unresolved = 0
+        for key, request in pending.items():
+            resolved = journal.completed(request)
+            for index in where[key]:
+                responses[index] = resolved
+            unresolved += resolved is None
+        if unresolved:
+            # Only reachable on the batched path (sequential raised already). Abort so a
+            # re-run resumes: completed responses replay, only the failures are retried.
+            raise RuntimeError(
+                f"{unresolved} batched request(s) failed and were journaled as errors; "
+                "re-run to resume (completed responses replay, only failures retry)")
+    return responses
+
+
 def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, Any],
                    judge_backend: Any, output_dir: str | Path, *, rubric: str,
                    generation_config: Any, judge_config: Any | None = None,
-                   seed: int = 0) -> dict[str, Any]:
+                   seed: int = 0, batch_size: int | None = None) -> dict[str, Any]:
     """Generate direct harmful sources once/checkpoint and every retained rewrite.
 
     Backends are callables(request)->{text,finish_reason}, exposing spec/tokenizer.
@@ -203,35 +250,53 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
     results = []
     judge = JournalBackend(judge_backend, destination / "judge_requests.jsonl")
     journals = [judge]
+    incomplete_grade = lambda status: {**{field: None for field in JUDGE_FIELDS},
+                                        "status": status, "rationale": ""}
     for label, backend in checkpoints.items():
         generator = JournalBackend(backend, destination / ("generation_" + _hash(label)[:16] + ".jsonl"))
         journals.append(generator)
-        for kind, target, row in _evaluation_jobs(candidates, label):
-            job_id = _hash([label, kind, row["item_id"]])
-            generation_request = _request(backend, [{"role": "user", "content": target}],
-                                          generation_config, seed, "evaluation_" + kind)
-            generation_request["sample_id"] = job_id
-            completion = generator(generation_request)
-            if not isinstance(completion.get("text"), str):
-                raise ValueError("generation backend must return text")
-            if completion.get("finish_reason") == "stop":
-                judgment = judge(_request(judge_backend,
+        jobs = list(_evaluation_jobs(candidates, label))
+        # 1. Generate every answer for this checkpoint in one batch (vLLM runs them
+        #    together; HF falls back to one at a time), replaying any journaled.
+        generation_requests = []
+        for kind, target, row in jobs:
+            request = _request(backend, [{"role": "user", "content": target}],
+                               generation_config, seed, "evaluation_" + kind)
+            request["sample_id"] = _hash([label, kind, row["item_id"]])
+            generation_requests.append(request)
+        completions = _journaled_responses(generator, generation_requests, batch_size=batch_size)
+        # 2. Grade the generations that finished cleanly, concurrently (OpenAI judge).
+        judge_slots, judge_requests = [], []
+        for index, (kind, target, row) in enumerate(jobs):
+            completion = completions[index]
+            if isinstance(completion, Mapping) and completion.get("finish_reason") == "stop":
+                judge_slots.append(index)
+                judge_requests.append(_request(judge_backend,
                     blinded_judge_messages(target, rubric, completion.get("answer_text", completion["text"])),
                     judge_config, seed, "evaluation_judge"))
-                grade = parse_grade(judgment)
+        judgments = _journaled_responses(judge, judge_requests, batch_size=batch_size)
+        grades = {}
+        for slot, judgment in zip(judge_slots, judgments):
+            grades[slot] = parse_grade(judgment) if judgment is not None else incomplete_grade("judge_incomplete")
+        # 3. Assemble the per-job results in order.
+        for index, (kind, target, row) in enumerate(jobs):
+            completion = completions[index]
+            if not (isinstance(completion, Mapping) and isinstance(completion.get("text"), str)):
+                answer, finish, grade = "", "generation_error", incomplete_grade("generation_incomplete")
             else:
-                grade = {**{field: None for field in JUDGE_FIELDS},
-                         "status": "generation_incomplete", "rationale": ""}
+                answer, finish = completion["text"], completion.get("finish_reason")
+                grade = grades.get(index, incomplete_grade("generation_incomplete"))
             result = {
-                "job_id": job_id, "protocol_sha256": protocol["protocol_sha256"],
+                "job_id": _hash([label, kind, row["item_id"]]),
+                "protocol_sha256": protocol["protocol_sha256"],
                 "checkpoint": label, "checkpoint_identity": protocol["checkpoints"][label],
                 "kind": kind, "item_id": row["item_id"],
                 "family_id": row["family_id"], "source_id": _hash(row["source"]),
                 "selection_group": row["selection_group"],
                 "control_group": row.get("control_group", "unassigned"),
                 "target_policy": row["target_policy"] if kind == "framed" else "prohibited",
-                "target_sha256": _hash(target), "answer": completion["text"],
-                "finish_reason": completion.get("finish_reason"), "grade": grade,
+                "target_sha256": _hash(target), "answer": answer,
+                "finish_reason": finish, "grade": grade,
             }
             result["result_sha256"] = _hash(result)
             results.append(result)
@@ -963,9 +1028,24 @@ def _backend_from_config(config: Mapping[str, Any], *, judge: bool = False):
         # not apply to an API model.
         return OpenAIJudgeBackend(config[key]["model"])
     spec = ModelSpec(**config[key])
+    adapter = None if judge else config.get("adapter_path")
+    # Opt-in batched vLLM victim generation (base or LoRA). The judge never uses it.
+    if not judge and config.get("generation_backend") == "vllm":
+        from .inference import VLLMAdapterBackend, VLLMBackend
+        vllm_options = {"dtype": config.get("vllm_dtype", "bfloat16"),
+                        "max_model_len": int(config.get("vllm_max_model_len", 8192)),
+                        "gpu_memory_utilization": float(config.get("vllm_gpu_memory_utilization", 0.9))}
+        if adapter:
+            manifest, manifest_path, evidence = _adapter_training_manifest(config)
+            backend = VLLMAdapterBackend(spec, adapter,
+                                         expected_adapter_sha256=config.get("adapter_sha256"), **vllm_options)
+            backend.fingerprint["training_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            backend.fingerprint.update(evidence)
+            backend.identity = backend.fingerprint  # keep _prepare's identity check in sync with the request stamp
+            return backend
+        return VLLMBackend(spec, **vllm_options)
     options = {"device": config.get("judge_device" if judge else "device", "cpu"),
                "dtype": config.get("dtype", "auto")}
-    adapter = None if judge else config.get("adapter_path")
     if adapter:
         expected = config.get("judge_adapter_sha256" if judge else "adapter_sha256")
         manifest, manifest_path, evidence = _adapter_training_manifest(config)
@@ -1139,7 +1219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             judge = backend if same_base else _backend_from_config(config, judge=True)
             report = run_evaluation(rows, {args.checkpoint: backend}, judge, args.output_dir,
                 rubric=config.get("rubric", RUBRIC), generation_config=decoding, seed=seed,
-                judge_config=GenerationConfig(**config.get("judge_generation", {"temperature": 0})))
+                judge_config=GenerationConfig(**config.get("judge_generation", {"temperature": 0})),
+                batch_size=config.get("eval_batch_size"))
             print(json.dumps({"output_dir": str(args.output_dir), "joint_claim": report["joint_claim"]}))
         else:
             benchmark = load_json_records(args.input)

@@ -67,6 +67,13 @@ export USE_JUDGE="${USE_JUDGE:-0}"
 # Stage-4 grading judge. Empty = local 8B judge. Set to a cheap OpenAI model
 # (e.g. gpt-4o-mini) to grade via API -- also set OPENAI_API_KEY in the env.
 export OPENAI_JUDGE_MODEL="${OPENAI_JUDGE_MODEL:-}"
+# Stage-4 answer generation engine. 'vllm' batches all test prompts through one
+# vLLM engine (base + LoRA adapters), far faster than 'hf' (one prompt at a time).
+# Outputs differ numerically from HF, so each engine keeps its own journal/identity.
+export EVAL_BACKEND="${EVAL_BACKEND:-vllm}"
+# How many generations/grades to journal per chunk during stage-4 eval (vLLM path):
+# a mid-run disconnect loses at most one chunk, then resumes. Bigger = fewer flushes.
+export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-128}"
 # Start SMALL to prove the pipeline end to end, then set to 'all' for the real run.
 export MAX_CANDIDATES="${MAX_CANDIDATES:-20}"
 export PAIR_LIMIT="${PAIR_LIMIT:-2048}"       # even; cap on the balanced train set

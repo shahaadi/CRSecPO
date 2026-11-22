@@ -82,6 +82,40 @@ def test_interrupted_judge_resumes_without_regenerating_answer(tmp_path):
     assert len(load_json_records(tmp_path / "results.jsonl")) == 2
 
 
+class BatchBackend(Backend):
+    """Backend that also exposes a batch API (like vLLM generation / OpenAI grading)."""
+
+    def generate_many(self, requests):
+        out = []
+        for request in requests:
+            try:
+                out.append(self(request))
+            except Exception as error:  # noqa: BLE001 - returned per request, journaled by caller
+                out.append(error)
+        return out
+
+
+def test_batched_path_matches_sequential_and_resumes(tmp_path):
+    rows = [candidate(index, target=f"framed request {index}", source=f"direct-{index}",
+                       family_id=f"family{index}") for index in range(4)]
+    batched_model, batched_judge = BatchBackend(), BatchBackend("judge", judge=True)
+    run_evaluation(rows, {"base": batched_model}, batched_judge, tmp_path / "batched",
+                   rubric="frozen", generation_config=GenerationConfig(), batch_size=2)  # exercise chunking
+    seq_model, seq_judge = Backend(), Backend("judge", judge=True)
+    run_evaluation(rows, {"base": seq_model}, seq_judge, tmp_path / "seq",
+                   rubric="frozen", generation_config=GenerationConfig())
+    batched = load_json_records(tmp_path / "batched" / "results.jsonl")
+    sequential = load_json_records(tmp_path / "seq" / "results.jsonl")
+    # The batched engine must produce byte-identical result rows to the sequential one.
+    assert {row["result_sha256"] for row in batched} == {row["result_sha256"] for row in sequential}
+    assert len(batched) == len(sequential) == 8  # 4 framed + 4 direct
+    # Resume replays every completed generation and grade without a new backend call.
+    gen_calls, judge_calls = len(batched_model.calls), len(batched_judge.calls)
+    run_evaluation(rows, {"base": batched_model}, batched_judge, tmp_path / "batched",
+                   rubric="frozen", generation_config=GenerationConfig(), batch_size=2)
+    assert len(batched_model.calls) == gen_calls and len(batched_judge.calls) == judge_calls
+
+
 def test_truncated_generation_never_becomes_safe(tmp_path):
     model, judge = Backend(truncate=True), Backend("judge", judge=True)
     summary = run_evaluation([candidate()], {"base": model}, judge, tmp_path,

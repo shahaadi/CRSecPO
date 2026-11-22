@@ -20,7 +20,9 @@ fi
 make_eval_config () {  # $1 = checkpoint, $2 = adapter_dir ("" for base) -> prints config path
   local ck="$1" adapter="$2" out="${CFG_DIR}/eval_${ck}.json"
   REPO_ROOT="${REPO_ROOT}" CK="${ck}" ADAPTER="${adapter}" OUT="${out}" \
-  OPENAI_JUDGE_MODEL="${OPENAI_JUDGE_MODEL:-}" python - <<'PY'
+  OPENAI_JUDGE_MODEL="${OPENAI_JUDGE_MODEL:-}" EVAL_BACKEND="${EVAL_BACKEND:-hf}" \
+  EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-128}" \
+  PAIRS_GPU_MEM="${PAIRS_GPU_MEM:-0.9}" PAIRS_MAX_LEN="${PAIRS_MAX_LEN:-8192}" python - <<'PY'
 import json, os
 from pathlib import Path
 base = json.loads((Path(os.environ["REPO_ROOT"]) / "configs/crsecpo_evaluation.json").read_text())
@@ -29,6 +31,13 @@ if os.environ["ADAPTER"]:
 judge_model = os.environ.get("OPENAI_JUDGE_MODEL", "").strip()
 if judge_model:                                     # grade via a cheap OpenAI model
     base["judge_model"] = {"provider": "openai", "model": judge_model}
+if os.environ.get("EVAL_BACKEND", "hf").strip() == "vllm":   # batch generation through vLLM
+    base["generation_backend"] = "vllm"
+    base["vllm_gpu_memory_utilization"] = float(os.environ["PAIRS_GPU_MEM"])
+    base["vllm_max_model_len"] = int(os.environ["PAIRS_MAX_LEN"])
+    # Flush the journal every this-many generations/grades so a mid-run disconnect
+    # loses at most one chunk (and resumes from there).
+    base["eval_batch_size"] = int(os.environ.get("EVAL_BATCH_SIZE", "128"))
 Path(os.environ["OUT"]).write_text(json.dumps(base, indent=2) + "\n")
 print(os.environ["OUT"])
 PY

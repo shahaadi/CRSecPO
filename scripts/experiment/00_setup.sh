@@ -18,8 +18,8 @@ pip install -q "openai>=1.40"   # optional OpenAI grading judge for stage 4
 # PEFT eagerly version-checks torchao during LoRA injection and errors on the old
 # torchao Colab preinstalls. We never use torchao (plain bf16 LoRA), so remove it.
 pip uninstall -q -y torchao 2>/dev/null || true
-if [ "${PAIRS_BACKEND}" = "vllm" ]; then
-  pip install -q "vllm" || { echo "vLLM install failed; set PAIRS_BACKEND=hf in config.sh"; exit 1; }
+if [ "${PAIRS_BACKEND}" = "vllm" ] || [ "${EVAL_BACKEND:-hf}" = "vllm" ]; then
+  pip install -q "vllm" || { echo "vLLM install failed; set PAIRS_BACKEND=hf and EVAL_BACKEND=hf in config.sh"; exit 1; }
 fi
 
 # Llama is a gated model: you must have accepted its license and provide a token.

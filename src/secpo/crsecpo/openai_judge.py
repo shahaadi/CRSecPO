@@ -48,7 +48,8 @@ class _StubTokenizer:
 class OpenAIJudgeBackend:
     """Judge backend that grades via an OpenAI chat model instead of a local LM."""
 
-    def __init__(self, model, *, max_completion_tokens=4096, max_retries=6, base_delay=2.0):
+    def __init__(self, model, *, max_completion_tokens=4096, max_retries=6, base_delay=2.0,
+                 concurrency=8):
         if not isinstance(model, str) or not model.strip():
             raise ValueError("OpenAI judge requires a non-empty model name")
         if not os.environ.get("OPENAI_API_KEY"):
@@ -62,6 +63,7 @@ class OpenAIJudgeBackend:
         self.max_completion_tokens = int(max_completion_tokens)
         self.max_retries = int(max_retries)
         self.base_delay = float(base_delay)
+        self.concurrency = max(1, int(concurrency))
         identity = {"schema_version": SCHEMA_VERSION, "provider": "openai",
                     "model": self.model, "response_format": "json_object"}
         self.spec = _OpenAIJudgeSpec(provider="openai", model=self.model)
@@ -93,3 +95,27 @@ class OpenAIJudgeBackend:
                     "model": self.spec.to_dict(), "backend_identity": self.fingerprint}
         raise RuntimeError(
             f"OpenAI judge '{self.model}' failed after {self.max_retries} retries: {last_error}")
+
+    def generate_many(self, requests):
+        """Grade a batch of requests concurrently; one response or Exception each, in order.
+
+        Each worker runs the same single-request path (with its own retry/backoff),
+        so journaling (done by the caller) and resume are unchanged. API calls are
+        independent, so concurrency just hides their latency.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        requests = list(requests)
+        results: list = [None] * len(requests)
+
+        def grade(index):
+            try:
+                return index, self(requests[index])
+            except Exception as error:  # noqa: BLE001 - returned per-request, journaled by caller
+                return index, error
+
+        workers = max(1, min(self.concurrency, len(requests)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for index, outcome in pool.map(grade, range(len(requests))):
+                results[index] = outcome
+        return results

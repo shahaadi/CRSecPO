@@ -33,4 +33,31 @@ python -m secpo.crsecpo.evaluation aggregate \
 
 backup_work
 echo "Aggregate report: ${AGG_DIR}/summary.json"
-echo "Read contrasts[*].passed and the top-level joint_claim there."
+echo
+# Print the decision right here in the cell output: the headline joint_claim, the
+# eligibility gates it depends on, and every prespecified contrast (one-sided
+# upper bound vs. its limit). Reads only the just-written summary.
+AGG_DIR="${AGG_DIR}" python - <<'PY'
+import json, os
+from pathlib import Path
+summary = json.loads((Path(os.environ["AGG_DIR"]) / "summary.json").read_text())
+decision = summary.get("decision", summary)
+yn = lambda b: "PASS" if b else "fail"
+print("================= CRSecPO DECISION =================")
+print(f"joint_claim: {decision.get('joint_claim')}")
+gates = ("coverage_complete", "training_comparable",
+         "independent_families_attested", "grading_audit_passed")
+print("eligibility gates: " + "  ".join(f"{g}={decision.get(g)}" for g in gates))
+print("---- contrasts (one-sided upper bound must be <= limit) ----")
+for name, c in decision.get("contrasts", {}).items():
+    upper = c.get("upper")
+    upper_s = "n/a" if upper is None else f"{upper:.4f}"
+    extra = f" [{c['status']}]" if c.get("status") not in (None, "ok", "bounded") else ""
+    basis = f" basis={c['control_basis']}" if c.get("control_basis") else ""
+    print(f"  [{yn(c.get('passed'))}] {name}: upper={upper_s} limit={c.get('limit')}"
+          f" families={c.get('families')}{basis}{extra}")
+print("===================================================")
+if not decision.get("joint_claim"):
+    print("joint_claim is False: see the gates/contrasts above. Utility contrasts and the")
+    print("two attestations (UTILITY=..., ATTEST=...) are required for the full headline claim.")
+PY

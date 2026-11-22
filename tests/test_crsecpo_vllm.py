@@ -458,6 +458,7 @@ def make_backend(outputs, context_limit=None, max_model_len=8192):
     backend.sampling_defaults = IDENTITY["sampling_defaults"]
     backend.stop_ids, backend.context_limit, backend.max_model_len = {7, 9}, context_limit, max_model_len
     backend.llm = FakeLLM(outputs)
+    backend._lora_request = None  # bare base engine (no LoRA), as __init__ would set
     return backend
 
 
