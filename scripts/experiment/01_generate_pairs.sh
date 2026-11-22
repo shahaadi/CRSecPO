@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Stage 1: generate preference pairs for the TRAIN+VALIDATION set.
+# Stage 1: generate preference pairs for TRAIN and VALIDATION (as separate
+# exports). Test is NOT generated here -- it is the held-out eval set.
 #
-# Full-epoch training uses no validation-based selection, so the train and
-# validation splits are merged into one training set here (test stays held out).
 # For each candidate the model produces an "ordinary" answer (bare framed query)
-# and a "combined" answer (rubric + the vanilla counterfactual in context);
-# judge-free, the pair becomes (chosen=combined, rejected=ordinary).
+# and a "combined" answer (rubric + the vanilla source in context); judge-free,
+# the pair becomes (chosen=combined, rejected=ordinary).
 #
-# The journal makes this resumable: re-run after an interruption and it continues.
+# These two exports are then folded into one training set by reuse_pairs.sh (no
+# regeneration) before stage 2 freezes it:
+#     bash 01_generate_pairs.sh && bash reuse_pairs.sh && bash 02_freeze_pairs.sh
+#
+# The journal makes this resumable AND reuse-aware: re-running with the same
+# candidates and existing journals replays them instead of regenerating.
 set -euo pipefail
 # Capture the script dir before config.sh changes the working directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,10 +45,10 @@ gen () {  # $1 = split name, $2 = candidates file
     ${JUDGE_ARG}
 }
 
-# Merge train + validation into one training candidate set (test stays held out).
-python "${SCRIPT_DIR}/_make_trainval.py"
-gen train "${WORK}/trainval_candidates.jsonl"
+gen train      "${TRAIN_CANDIDATES}"
+gen validation "${VAL_CANDIDATES}"
 
-echo "Training pairs (train+validation): ${PAIRS_DIR}/train_pairs.jsonl"
-echo "NOTE: with judge-free acceptance, accepted pairs ~= candidates whose two"
-echo "      answers differ. If too few, raise MAX_CANDIDATES in config.sh ('all')."
+echo "Train pairs:      ${PAIRS_DIR}/train_pairs.jsonl"
+echo "Validation pairs: ${PAIRS_DIR}/validation_pairs.jsonl"
+echo "Next: bash reuse_pairs.sh (folds these two into merged_pairs.jsonl without"
+echo "      regenerating), then bash 02_freeze_pairs.sh."
