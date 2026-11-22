@@ -2,12 +2,13 @@
 
 One config drives all three arms (sft/dpo/crsecpo): the only thing that differs
 between arms is --method, so their training configs stay identical and the runs
-count as "comparable". Validation selection uses eval_loss because SFT (a plain
-LM run) cannot produce the preference-accuracy metric; eval_loss is computable
-for every arm, which is what comparability requires.
+count as "comparable". Training runs one full epoch and keeps the end-of-epoch
+checkpoint (no validation-based selection). save_strategy="steps" still writes
+periodic checkpoints so a disconnect can resume; the final model saved after the
+epoch is the one used.
 
 Env in: REPO_ROOT, CFG_DIR, MODEL_ID, MODEL_REVISION, TRAIN_OUT, FROZEN_DIR,
-        PAIRS_DIR, EVAL_STEPS, SAVE_STEPS.
+        SAVE_STEPS.
 """
 import json, os
 from pathlib import Path
@@ -25,16 +26,9 @@ template.update({
     # constant (batch * accum = 64), so the optimization is unchanged across cards.
     "per_device_train_batch_size": int(os.environ["TRAIN_BATCH"]),
     "gradient_accumulation_steps": int(os.environ["GRAD_ACCUM"]),
-    # ---- validation-based best-checkpoint selection (comparable across arms) ----
-    "eval_data_file": str(Path(os.environ["PAIRS_DIR"]) / "validation_pairs.jsonl"),
-    "eval_strategy": "steps",
-    "eval_steps": int(os.environ["EVAL_STEPS"]),
+    # Periodic checkpoints for resume; the final (end-of-epoch) model is kept.
     "save_strategy": "steps",
     "save_steps": int(os.environ["SAVE_STEPS"]),
-    "save_total_limit": 3,
-    "load_best_model_at_end": True,
-    "metric_for_best_model": "eval_loss",
-    "greater_is_better": False,
 })
 
 out = Path(os.environ["CFG_DIR"]) / "train_experiment.json"
