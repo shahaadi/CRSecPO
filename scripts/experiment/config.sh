@@ -23,7 +23,31 @@ export VAL_CANDIDATES="${SPLIT_DIR}/validation.jsonl"
 export TEST_CANDIDATES="${SPLIT_DIR}/test.jsonl"
 
 # ---- outputs ----
+# IMPORTANT: the pipeline's crash-safe writers use hard links (os.link) for the
+# journals and manifests that make every stage resumable. Google Drive's FUSE
+# mount does NOT support hard links, so WORK must be on real local disk. If you
+# point WORK at Drive, we transparently run on local disk and use the Drive path
+# as a backup target (restored on a fresh runtime, synced after each stage), so
+# you still survive disconnects without feeding Drive to the atomic writers.
 export WORK="${WORK:-${REPO_ROOT}/experiment_out}"
+export DRIVE_BACKUP="${DRIVE_BACKUP:-}"
+if [[ "${WORK}" == */drive/* ]]; then
+  DRIVE_BACKUP="${WORK}"
+  WORK="/content/crsecpo_out"
+  echo "[config] WORK was on Google Drive (no hard-link support); running on ${WORK} and backing up to ${DRIVE_BACKUP}"
+fi
+if [ -n "${DRIVE_BACKUP}" ] && [ ! -d "${WORK}" ] && [ -d "${DRIVE_BACKUP}" ]; then
+  echo "[config] restoring previous run from ${DRIVE_BACKUP} ..."
+  mkdir -p "${WORK}" && rsync -a "${DRIVE_BACKUP}/" "${WORK}/" || true
+fi
+# Mirror local work to the Drive backup (no-op when DRIVE_BACKUP is unset).
+backup_work () {
+  [ -n "${DRIVE_BACKUP:-}" ] || return 0
+  mkdir -p "${DRIVE_BACKUP}" 2>/dev/null || true
+  rsync -a "${WORK}/" "${DRIVE_BACKUP}/" 2>/dev/null || true
+}
+export -f backup_work 2>/dev/null || true
+export WORK DRIVE_BACKUP
 export PAIRS_DIR="${WORK}/pairs"
 export FROZEN_DIR="${WORK}/frozen_train"      # holds the balanced 50/50 train_pairs.jsonl
 export TRAIN_OUT="${WORK}/checkpoints"        # per-method adapters land in $TRAIN_OUT/<method>

@@ -23,4 +23,5 @@ python -m secpo.crsecpo.training \
   --output-dir "${FROZEN_DIR}" \
   --pair-limit "${PAIR_LIMIT}"
 
+backup_work
 echo "Frozen balanced set: ${FROZEN_DIR}/train_pairs.jsonl (+ selection_manifest.json)"

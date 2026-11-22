@@ -31,5 +31,6 @@ python -m secpo.crsecpo.evaluation aggregate \
   --benign-control-basis benign_adversarial_control_group \
   ${UTILITY} ${ATTEST}
 
+backup_work
 echo "Aggregate report: ${AGG_DIR}/summary.json"
 echo "Read contrasts[*].passed and the top-level joint_claim there."

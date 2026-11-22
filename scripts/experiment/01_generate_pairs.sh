@@ -12,6 +12,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/config.sh"
 
 echo "== Stage 1: generate pairs (backend=${PAIRS_BACKEND}, max_candidates=${MAX_CANDIDATES}) =="
 
+# Pair generation is the long stage. If a Drive backup is configured, mirror the
+# journal to it every 2 min (and once more on exit) so a disconnect loses little.
+if [ -n "${DRIVE_BACKUP:-}" ]; then
+  ( while true; do sleep 120; backup_work; done ) & SYNC_PID=$!
+  trap 'kill ${SYNC_PID} 2>/dev/null || true; backup_work' EXIT
+fi
+
 gen () {  # $1 = split name, $2 = candidates file
   local split="$1" cand="$2"
   echo "--- ${split} pairs from ${cand} ---"

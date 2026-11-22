@@ -41,6 +41,7 @@ for METHOD in sft dpo crsecpo; do
     train_method "${METHOD}"
   fi
   echo "adapter: ${OUT}"
+  backup_work
 done
 
 echo "Trained adapters under ${TRAIN_OUT}/{sft,dpo,crsecpo}."

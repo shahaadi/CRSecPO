@@ -5,6 +5,13 @@ Scripts to take the 70/10/20 preview splits through the full pipeline:
 test → aggregate the contrasts.** Each stage is resumable and writes under
 `experiment_out/` (override with `WORK`).
 
+**Google Drive note:** the crash-safe writers use hard links, which Drive's FUSE
+mount does not support, so `WORK` must be on local disk. If you set `WORK` to a
+Drive path (common on Colab for persistence), `config.sh` detects it, runs on
+local disk anyway, and uses the Drive path as a **backup** — restored on a fresh
+runtime and synced after each stage (every 2 min during pair generation). So
+you get both: working hard links and disconnect-survival, with nothing to do.
+
 ## Order
 
 ```bash

@@ -32,9 +32,9 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
     --output-dir "${EVAL_DIR}/${ck}"
 }
 
-run_ck base    ""
-run_ck sft     "${TRAIN_OUT}/sft"
-run_ck dpo     "${TRAIN_OUT}/dpo"
-run_ck crsecpo "${TRAIN_OUT}/crsecpo"
+run_ck base    "";                backup_work
+run_ck sft     "${TRAIN_OUT}/sft";     backup_work
+run_ck dpo     "${TRAIN_OUT}/dpo";     backup_work
+run_ck crsecpo "${TRAIN_OUT}/crsecpo"; backup_work
 
 echo "Per-checkpoint results under ${EVAL_DIR}/{base,sft,dpo,crsecpo}."
