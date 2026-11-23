@@ -32,14 +32,19 @@ fi
 gen () {  # $1 = split name, $2 = candidates file
   local split="$1" cand="$2"
   local out="${PAIRS_DIR}/${split}_pairs.jsonl"
-  # Idempotent: if this split's pair export already exists, keep it and do NOT
-  # re-enter pair generation. reuse_pairs.sh reads these exports raw (immune to
-  # Drive-corrupted sidecars) and folds them into the training set, so once the
-  # export is present there is no reason to touch the resumable reservation path
-  # (whose sidecar JSON is exactly what Google Drive tends to truncate to empty).
-  if [ -s "${out}" ]; then
-    echo "--- ${split}: ${out} already present ($(wc -l < "${out}") pairs); skipping generation ---"
+  local journal="${PAIRS_DIR}/${split}_journal.jsonl"
+  # Skip ONLY migrated data: a pair export with NO generation journal means you dropped
+  # in pre-made pairs (reuse_pairs reads them raw, immune to Drive-corrupted sidecars),
+  # so there is no reason to re-enter the reservation path. But if a journal EXISTS this
+  # split was generated here, so run pairs.py to RESUME: it replays every finished answer
+  # and retries only the ones that errored. A fully complete journal re-exports in seconds
+  # without even loading the model (the backend starts only if a request is still missing).
+  if [ -s "${out}" ] && [ ! -e "${journal}" ]; then
+    echo "--- ${split}: ${out} present with no journal (migrated); skipping generation ---"
     return 0
+  fi
+  if [ -s "${out}" ]; then
+    echo "--- ${split}: resuming (replay finished answers, retry errored ones) ---"
   fi
   echo "--- ${split} pairs from ${cand} ---"
   python -m secpo.crsecpo.pairs "${cand}" \
