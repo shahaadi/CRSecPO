@@ -52,7 +52,17 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   local ck="$1" adapter="$2"
   local cfg; cfg="$(make_eval_config "${ck}" "${adapter}")"
   local out="${EVAL_DIR}/${ck}" log="${CFG_DIR}/eval_${ck}.log"
+  local applied="${CFG_DIR}/eval_${ck}.applied.json"
   echo "--- safety: ${ck} ---"
+  # Skip entirely (no model load, no replay) if this checkpoint already finished
+  # under the SAME eval config. The applied-config snapshot is what makes this
+  # safe: a changed backend/judge/model/adapter produces a different config, so it
+  # does NOT match and we fall through to run. An INCOMPLETE dir (crash mid-run)
+  # has no summary.json, so it also falls through and resumes from the journal.
+  if [ -s "${out}/summary.json" ] && [ -f "${applied}" ] && cmp -s "${cfg}" "${applied}"; then
+    echo "    already evaluated with the current config; skipping"
+    return 0
+  fi
   # Journaled: a prior run with the SAME protocol replays/resumes. But if this dir
   # holds a protocol from a DIFFERENT configuration (e.g. you switched generation to
   # vLLM or added the OpenAI judge), its hash won't match and resume is impossible.
@@ -67,6 +77,7 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
       exit 1
     fi
   fi
+  cp -f "${cfg}" "${applied}"   # record the config this finished dir was produced with
 }
 
 run_ck base    "";                backup_work
