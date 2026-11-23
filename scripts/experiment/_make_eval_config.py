@@ -36,22 +36,27 @@ if os.environ.get("EVAL_BACKEND", "hf").strip() == "vllm":
     config["vllm_max_model_len"] = int(os.environ["PAIRS_MAX_LEN"])
     config["eval_batch_size"] = int(os.environ.get("EVAL_BATCH_SIZE", "128"))
 
-if mode == "repair":
+def common_budget():
+    """The single victim budget every checkpoint ends at. Under vLLM the answer must
+    fit max_model_len alongside the prompt, so cap at (max_model_len - prompt reserve);
+    an item whose prompt is longer than the reserve still won't fit and is left
+    unrepaired (the repair tolerates it). On a bigger-context card, raise
+    vllm_max_model_len (PAIRS_MAX_LEN) to give long answers more room."""
     budget = int(os.environ["REPAIR_MAX_NEW_TOKENS"])
-    # The answer must fit the context alongside the prompt. Under vLLM the hard cap
-    # is max_model_len, so leave REPAIR_PROMPT_RESERVE tokens for the prompt; an item
-    # whose prompt is longer than that reserve still won't fit and is left unrepaired
-    # (the repair tolerates it rather than aborting). On a card with a bigger context,
-    # raise vllm_max_model_len (PAIRS_MAX_LEN) to give long answers more room.
     if os.environ.get("EVAL_BACKEND", "hf").strip() == "vllm":
         reserve = int(os.environ.get("REPAIR_PROMPT_RESERVE", "1024"))
         budget = max(256, min(budget, int(os.environ["PAIRS_MAX_LEN"]) - reserve))
-    config["generation"]["max_new_tokens"] = budget
+    return budget
+
+if mode == "repair":
+    config["generation"]["max_new_tokens"] = common_budget()
     config["judge_max_completion_tokens"] = int(os.environ["REPAIR_JUDGE_TOKENS"])
 else:
-    # Sticky budgets: reproduce what this dir was last built with so a re-run
-    # replays it. Prefer the applied-config snapshot (it also carries the judge
-    # budget); otherwise fall back to the generation budget recorded in protocol.json.
+    # Sticky budgets: reproduce what this dir was last built with so a re-run replays
+    # it. Prefer the applied-config snapshot (it also carries the judge budget), else
+    # the budget recorded in protocol.json. A brand-new checkpoint (neither exists)
+    # starts directly at the common budget, so a fresh experiment is uniform from the
+    # first pass -- no second alignment needed.
     applied = Path(os.environ["CFG_DIR"]) / f"eval_{ck}.applied.json"
     protocol = Path(os.environ["EVAL_DIR"]) / ck / "protocol.json"
     if applied.exists():
@@ -64,6 +69,8 @@ else:
         recorded = json.loads(protocol.read_text()).get("generation_config", {}).get("max_new_tokens")
         if recorded is not None:
             config["generation"]["max_new_tokens"] = recorded
+    else:
+        config["generation"]["max_new_tokens"] = common_budget()
 
 out.write_text(json.dumps(config, indent=2) + "\n")
 print(str(out))
