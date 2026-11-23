@@ -658,7 +658,13 @@ def _comparable_training_runs(results):
             return False
         provenance = identity.get("backend_identity")
         if checkpoint == "base":
-            if provenance is not None:
+            # base must be the frozen model with NO trained adapter. A bare engine
+            # identity (e.g. vLLM's, which stamps the generation engine) carries no
+            # training fields and is fine; reject only an adapter or training
+            # provenance. The HF base has no backend_identity at all (None), which
+            # also passes.
+            if isinstance(provenance, Mapping) and (
+                    provenance.get("training_method") is not None or "adapter" in provenance):
                 return False
             continue
         if (not isinstance(provenance, Mapping) or provenance.get("training_method") != checkpoint

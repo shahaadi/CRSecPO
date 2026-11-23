@@ -794,6 +794,29 @@ def test_scoring_rejects_answers_generated_from_different_same_id_prompts(suite)
             score_gsm8k(rows, manifest, responses, official_is_correct=lambda *_: True, provenance=provenance)
 
 
+def test_base_accepts_bare_engine_identity_but_rejects_training_provenance():
+    from secpo.crsecpo.evaluation import _comparable_training_runs
+    spec = ModelSpec("base", "a" * 40, "base", "a" * 40).to_dict()
+    engine = {"schema_version": "crsecpo-vllm-backend-v1", "engine": "vllm",
+              "engine_version": "0.0.0", "dtype": "bfloat16", "max_model_len": 8192,
+              "sampling_defaults": {}}
+
+    def rows(base_identity):
+        out = [{"checkpoint": "base", "checkpoint_identity": {"model": spec, "backend_identity": base_identity}}]
+        for method in ("sft", "dpo", "crsecpo"):
+            out.append({"checkpoint": method, "checkpoint_identity": {"model": spec, "backend_identity": {
+                **engine, "training_method": method, "training_complete": True,
+                "trainer_state_sha256": "d" * 64, "training_comparison_sha256": "e" * 64}}})
+        return out
+
+    # HF base (no backend identity) and a bare vLLM engine identity both pass.
+    assert _comparable_training_runs(rows(None))
+    assert _comparable_training_runs(rows(engine))
+    # A base carrying training provenance or an attached adapter is rejected.
+    assert not _comparable_training_runs(rows({**engine, "training_method": "sft"}))
+    assert not _comparable_training_runs(rows({**engine, "adapter": {"adapter_sha256": "f" * 64}}))
+
+
 def test_completed_training_identity_ignores_only_method_and_local_paths(tmp_path):
     from secpo.crsecpo.evaluation import _adapter_training_manifest, _comparable_training_runs
     spec = ModelSpec("base", "a" * 40, "base", "a" * 40).to_dict()
