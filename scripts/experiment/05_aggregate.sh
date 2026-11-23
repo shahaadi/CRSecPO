@@ -48,10 +48,14 @@ print(f"joint_claim: {decision.get('joint_claim')}")
 gates = ("coverage_complete", "training_comparable",
          "independent_families_attested", "grading_audit_passed")
 print("eligibility gates: " + "  ".join(f"{g}={decision.get(g)}" for g in gates))
-degenerated = decision.get("degenerated_responses") or {}
-if any(degenerated.values()):
-    print("degenerated/non-responses (all three grades False, e.g. repetition loops): "
-          + "  ".join(f"{k}={v}" for k, v in degenerated.items() if v))
+noncommittal = decision.get("noncommittal_responses") or {}
+if any(noncommittal.values()):
+    print("non-committal responses (neither refused, complied, nor helped -- usually a benign "
+          "deflection of a harmful ask): " + "  ".join(f"{k}={v}" for k, v in noncommittal.items()))
+repetition = decision.get("degenerate_repetition_responses") or {}
+if any(repetition.values()):
+    print("  of which true degenerate repetition loops (hand-marked): "
+          + "  ".join(f"{k}={v}" for k, v in repetition.items() if v))
 print("---- contrasts (one-sided upper bound must be <= limit) ----")
 for name, c in decision.get("contrasts", {}).items():
     upper = c.get("upper")
