@@ -36,7 +36,8 @@ python -m secpo.crsecpo.training \
   --freeze-pairs \
   --data-file "${FREEZE_INPUT}" \
   --output-dir "${FROZEN_DIR}" \
-  --pair-limit "${PAIR_LIMIT}"
+  --pair-limit "${PAIR_LIMIT}" \
+  --benign-fraction "${BENIGN_FRACTION:-0.5}"
 
 backup_work
 echo "Frozen balanced set: ${FROZEN_DIR}/train_pairs.jsonl (+ selection_manifest.json)"

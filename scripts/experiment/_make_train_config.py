@@ -31,6 +31,16 @@ template.update({
     "save_steps": int(os.environ["SAVE_STEPS"]),
 })
 
+# Tunable training strength (set in config.sh; defaults keep the template values).
+# Lower TRAIN_BETA / TRAIN_LR or fewer TRAIN_EPOCHS pull crsecpo back toward base
+# behaviour -- less over-refusal, but a smaller safety gain. These apply to all three
+# arms identically, so the runs stay comparable.
+for env_key, config_key, cast in (("TRAIN_BETA", "beta", float),
+                                  ("TRAIN_LR", "learning_rate", float),
+                                  ("TRAIN_EPOCHS", "num_train_epochs", float)):
+    if os.environ.get(env_key):
+        template[config_key] = cast(os.environ[env_key])
+
 out = Path(os.environ["CFG_DIR"]) / "train_experiment.json"
 out.write_text(json.dumps(template, indent=2) + "\n")
 print("wrote", out)

@@ -182,7 +182,7 @@ def prepare(config: Any, method: str, *, tokenizer: Any, require_selection: bool
     return rows, collator, manifest
 
 
-def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
+def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048, benign_fraction=0.5):
     """Publish one balanced common set; retain an audit entry for every input pair."""
     from .pairs import ordered_by_class_and_family
     from .records import sha256
@@ -215,9 +215,19 @@ def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
     classes = {name: [row for row in ordered if
         (row["selection_group"] == "harmful_benign_framing") == (name == "harmful")]
         for name in ("harmful", "benign")}
-    per_class = min(pair_limit // 2, *(len(values) for values in classes.values()))
-    if per_class == 0:
-        raise PreferenceSchemaError("no balanced common selection: both classes need usable pairs")
+    if not 0.0 < benign_fraction < 1.0:
+        raise ValueError("benign_fraction must be strictly between 0 and 1")
+    # Select the largest set (<= pair_limit) that holds the requested benign:harmful ratio
+    # given how many of each are available. 0.5 exactly reproduces the historical 50/50
+    # balance; raising it adds "help the suspicious benign request" examples to counter
+    # over-refusal (at some cost to harmful safety).
+    have = {name: len(values) for name, values in classes.items()}
+    total = min(pair_limit, int(have["benign"] / benign_fraction),
+                int(have["harmful"] / (1.0 - benign_fraction)))
+    target = {"benign": round(benign_fraction * total)}
+    target["harmful"] = total - target["benign"]
+    if target["benign"] == 0 or target["harmful"] == 0:
+        raise PreferenceSchemaError("no usable common selection: both classes need usable pairs")
     metadata = eligible[0]["pair_metadata"]
     collection_settings = {field: metadata.get(field) for field in COLLECTION_FIELDS}
     for field, value in collection_settings.items():
@@ -230,7 +240,9 @@ def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
     if len(retry_limits) != 1:
         raise PreferenceSchemaError("eligible pairs use different max_output_retries")
     collection_settings["max_output_retries"] = retry_limits.pop()
-    selected = [row for pair in zip(classes["harmful"][:per_class], classes["benign"][:per_class]) for row in pair]
+    chosen_ids = ({row["id"] for row in classes["harmful"][:target["harmful"]]}
+                  | {row["id"] for row in classes["benign"][:target["benign"]]})
+    selected = [row for row in ordered if row["id"] in chosen_ids]
     selected_ids = {row["id"] for row in selected}
     for entry in audit:
         if entry["id"] in selected_ids:
@@ -249,7 +261,7 @@ def freeze_pairs(config, *, tokenizer, output_dir, pair_limit=2048):
             "max_length": config.max_length, "max_prompt_length": config.max_prompt_length,
             **collection_settings,
             "eligible_counts": {name: len(values) for name, values in classes.items()},
-            "selected_counts": {name: per_class for name in classes},
+            "selected_counts": dict(target),
             "ordered_ids": [row["id"] for row in selected], "output_sha256": sha256(output),
             "audit_sha256": sha256(audit_path)}
         _write_manifest_once(staged / "selection_manifest.json", manifest)
@@ -415,6 +427,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--freeze-pairs", action="store_true",
                         help="Validate and freeze one balanced common pair file; never load model weights")
     parser.add_argument("--pair-limit", type=int, default=2048)
+    parser.add_argument("--benign-fraction", type=float, default=0.5,
+                        help="Fraction of the frozen set that is benign/safe pairs (0.5 = 50/50). "
+                             "Raise it to add 'help the suspicious benign request' examples and curb over-refusal.")
     parser.add_argument("--data-file", help="Override the fixed training-pairs file")
     parser.add_argument("--output-dir", help="Default: CONFIG_OUTPUT_DIR/METHOD")
     parser.add_argument("--prepare", "--dry-run", action="store_true", dest="prepare_only")
@@ -432,7 +447,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     tokenizer = _load_tokenizer(config)
     if args.freeze_pairs:
         print(json.dumps(freeze_pairs(config, tokenizer=tokenizer, output_dir=args.output_dir,
-                                      pair_limit=args.pair_limit), indent=2))
+                                      pair_limit=args.pair_limit, benign_fraction=args.benign_fraction), indent=2))
         return
     _, _, manifest = prepare(config, args.method, tokenizer=tokenizer, require_selection=True)
     manifest["training_config"] = asdict(config)

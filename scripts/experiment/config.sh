@@ -111,6 +111,16 @@ export SEED="${SEED:-42}"
 # save/eval cadence for best-checkpoint selection (save_steps must be a multiple of eval_steps)
 export EVAL_STEPS="${EVAL_STEPS:-8}"
 export SAVE_STEPS="${SAVE_STEPS:-8}"
+# ---- over-refusal tuning dials (empty = template defaults: beta 0.1, lr 1.6e-4, 1 epoch) ----
+# These move crsecpo ALONG the tradeoff curve: lower beta/lr or fewer epochs -> closer to
+# base -> less over-refusal but a smaller safety gain. Applied to all three arms equally.
+export TRAIN_BETA="${TRAIN_BETA:-}"      # e.g. 0.05 for a softer preference (less over-refusal)
+export TRAIN_LR="${TRAIN_LR:-}"          # e.g. 0.00008 for gentler updates
+export TRAIN_EPOCHS="${TRAIN_EPOCHS:-}"  # e.g. 1 (default); fractional allowed via max_steps upstream
+# Fraction of the balanced train set that should be benign/safe pairs (the other part is
+# harmful). 0.5 = the default 50/50. Raise it (e.g. 0.6) to show more "help the suspicious
+# benign request" examples, directly countering over-refusal (at some cost to harmful safety).
+export BENIGN_FRACTION="${BENIGN_FRACTION:-0.5}"
 
 # ---- GPU auto-tuning (automatic; you don't set anything) ----
 # Reads the card's VRAM and picks safe memory settings. A100/40GB+ gets the full
