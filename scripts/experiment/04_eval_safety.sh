@@ -55,14 +55,28 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
     echo "    already evaluated with the current config; skipping"
     return 0
   fi
-  # Journaled resume. If the dir holds a protocol from a DIFFERENT configuration
-  # (e.g. a different backend/judge), the hash won't match and resume is impossible;
-  # restart just this checkpoint fresh rather than aborting the whole stage.
+  # Journaled resume: a matching dir REPLAYS (no regeneration). If the stored
+  # protocol does NOT match (e.g. vLLM/transformers was upgraded, the judge model
+  # changed, or the eval config was edited), the dir cannot be resumed. We NEVER
+  # silently delete it -- doing so would scrap finished generations. By default we
+  # stop and explain; regeneration from scratch is strictly opt-in.
   if ! eval_safety "${ck}" "${cfg}" "${out}" 2>&1 | tee "${log}"; then
     if grep -q "resume protocol hash mismatch" "${log}"; then
-      echo "    (eval config changed since the last run; restarting ${ck} from a fresh dir)"
-      rm -rf "${out}"
-      eval_safety "${ck}" "${cfg}" "${out}"
+      if [ "${EVAL_FORCE_FRESH:-0}" = "1" ]; then
+        echo "    ${ck}: protocol changed AND EVAL_FORCE_FRESH=1 -> archiving the old dir and regenerating" >&2
+        mv "${out}" "${out}.superseded.$(ls -d "${out}".superseded.* 2>/dev/null | wc -l | tr -d ' ')"
+        eval_safety "${ck}" "${cfg}" "${out}"
+      else
+        echo "" >&2
+        echo "!! ${ck}: the stored eval protocol does not match the current one, so this dir" >&2
+        echo "   CANNOT be resumed. NOTHING was deleted -- your finished generations are intact." >&2
+        echo "   This almost always means the environment changed since you built it: a" >&2
+        echo "   different vLLM/transformers version, a different OPENAI_JUDGE_MODEL, or an" >&2
+        echo "   edited eval config. Restore the matching versions/model and re-run -- it will" >&2
+        echo "   then replay. ONLY if you intend to regenerate from scratch, re-run with" >&2
+        echo "   EVAL_FORCE_FRESH=1 (which ARCHIVES the old dir to ${out}.superseded.*, not delete)." >&2
+        exit 1
+      fi
     else
       echo "    (eval failed for ${ck}; see ${log})" >&2
       exit 1
@@ -82,13 +96,23 @@ repair_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   echo "    ${ck}: ${failed} failed item(s); regenerating ONLY those at ${REPAIR_MAX_NEW_TOKENS} tok (reusing the rest)"
   local cfg; cfg="$(make_eval_config "${ck}" "${adapter}" repair)"
   local repair="${out}.repair"; rm -rf "${repair}"
+  # The repair writes to a SEPARATE dir and only reads the original (via adopt). The
+  # original is replaced solely after the repaired dir is confirmed to cover the exact
+  # same jobs, so a bad repair can never scrap the finished work.
   if eval_safety "${ck}" "${cfg}" "${repair}" --adopt-completed-from "${out}"; then
-    rm -rf "${out}"; mv "${repair}" "${out}"
+    local before after
+    before="$(wc -l < "${out}/results.jsonl")"
+    after="$(wc -l < "${repair}/results.jsonl" 2>/dev/null || echo 0)"
+    if [ "${after}" != "${before}" ]; then
+      echo "    ${ck}: repaired dir covers ${after} jobs vs ${before}; keeping the ORIGINAL (inspect ${repair})" >&2
+      return 1
+    fi
+    # Crash-safe swap: the original is moved aside first, so the dir is never absent.
+    mv "${out}" "${out}.replacing" && mv "${repair}" "${out}" && rm -rf "${out}.replacing"
     cp -f "${cfg}" "${CFG_DIR}/eval_${ck}.applied.json"
     echo "    ${ck}: repaired; $(count_failed "${out}") item(s) still unresolved (raise REPAIR_MAX_NEW_TOKENS if any remain)"
   else
-    echo "    ${ck}: repair run failed; keeping the original dir" >&2
-    rm -rf "${repair}"
+    echo "    ${ck}: repair run failed; keeping the ORIGINAL dir unchanged (inspect ${repair})" >&2
     return 1
   fi
 }
