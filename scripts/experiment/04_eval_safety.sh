@@ -86,7 +86,8 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
 }
 
 repair_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
-  local ck="$1" adapter="$2" out="${EVAL_DIR}/${ck}"
+  local ck="$1" adapter="$2"
+  local out="${EVAL_DIR}/${ck}"
   [ -s "${out}/results.jsonl" ] || return 0
   local failed; failed="$(count_failed "${out}")"
   if [ "${failed}" = "0" ]; then
