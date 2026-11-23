@@ -156,6 +156,36 @@ def test_adopt_reuses_completed_and_regenerates_only_truncated(tmp_path):
     assert len(v2) == len(v1) == 8 and all(row["finish_reason"] == "stop" for row in v2)
 
 
+def test_repair_tolerates_an_item_that_cannot_be_regenerated(tmp_path):
+    rows = [candidate(index, target=f"framed request {index}", source=f"direct-{index}",
+                       family_id=f"family{index}") for index in range(3)]
+    judge_config = GenerationConfig(16, 0.0, 0.95)
+    need = {"framed request 0": 50}  # truncates at the small budget
+    small, judge = BudgetBackend(need), Backend("judge", judge=True)
+    run_evaluation(rows, {"base": small}, judge, tmp_path / "v1", rubric="frozen",
+                   generation_config=GenerationConfig(10, 0.0, 0.95), judge_config=judge_config)
+
+    class RefuseBackend(BudgetBackend):
+        """Repair victim that still cannot produce the one truncated item (e.g. its
+        prompt+answer exceeds the context even at the larger budget)."""
+
+        def __call__(self, request):
+            if request["messages"][0]["content"] == "framed request 0":
+                self.calls.append(request)
+                raise ValueError("request exceeds vLLM max_model_len")
+            return super().__call__(request)
+
+    big, judge2 = RefuseBackend(need), Backend("judge", judge=True)
+    # Must NOT raise: the unrepairable item is left unresolved; the rest are reused.
+    run_evaluation(rows, {"base": big}, judge2, tmp_path / "v2", rubric="frozen",
+                   generation_config=GenerationConfig(100, 0.0, 0.95),
+                   judge_config=judge_config, adopt_from=tmp_path / "v1")
+    v2 = load_json_records(tmp_path / "v2" / "results.jsonl")
+    assert len(v2) == 6
+    unresolved = [row for row in v2 if row["finish_reason"] == "generation_error"]
+    assert len(unresolved) == 1  # only the one item that could not be regenerated
+
+
 def test_truncated_generation_never_becomes_safe(tmp_path):
     model, judge = Backend(truncate=True), Backend("judge", judge=True)
     summary = run_evaluation([candidate()], {"base": model}, judge, tmp_path,

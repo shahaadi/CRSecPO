@@ -170,7 +170,7 @@ def _claim_evaluation_protocol(destination, protocol, *additional_artifacts):
     return protocol_path
 
 
-def _journaled_responses(journal, requests, *, batch_size=None):
+def _journaled_responses(journal, requests, *, batch_size=None, tolerate_failures=False):
     """Resolve each request to its journaled response (or None if it failed).
 
     Uses the backend's batched ``generate_many`` when available (vLLM generation,
@@ -199,6 +199,12 @@ def _journaled_responses(journal, requests, *, batch_size=None):
             if batched:
                 # Per-request failures are journaled (not raised); resolved below.
                 journal.record_batch(chunk, journal.backend.generate_many)
+            elif tolerate_failures:
+                for request in chunk:
+                    try:
+                        journal(request)
+                    except Exception:  # noqa: BLE001 - journaled as an error; left unresolved below
+                        pass
             else:
                 for request in chunk:
                     journal(request)  # sequential: raises on failure; resume replays completed, retries this one
@@ -208,7 +214,7 @@ def _journaled_responses(journal, requests, *, batch_size=None):
             for index in where[key]:
                 responses[index] = resolved
             unresolved += resolved is None
-        if unresolved:
+        if unresolved and not tolerate_failures:
             # Only reachable on the batched path (sequential raised already). Abort so a
             # re-run resumes: completed responses replay, only the failures are retried.
             raise RuntimeError(
@@ -323,7 +329,12 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
                                generation_config, seed, "evaluation_" + kind)
             request["sample_id"] = _hash([label, kind, row["item_id"]])
             generation_requests.append(request)
-        completions = _journaled_responses(generator, generation_requests, batch_size=batch_size)
+        # A repair run (adopt_from) is best-effort: an item that still cannot fit the
+        # context after the larger budget is left unresolved rather than aborting the
+        # whole pass (so the items that CAN be repaired still are).
+        tolerate = adopt_from is not None
+        completions = _journaled_responses(generator, generation_requests,
+                                           batch_size=batch_size, tolerate_failures=tolerate)
         # 2. Grade the generations that finished cleanly, concurrently (OpenAI judge).
         judge_slots, judge_requests = [], []
         for index, (kind, target, row) in enumerate(jobs):
@@ -333,7 +344,8 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
                 judge_requests.append(_request(judge_backend,
                     blinded_judge_messages(target, rubric, completion.get("answer_text", completion["text"])),
                     judge_config, seed, "evaluation_judge"))
-        judgments = _journaled_responses(judge, judge_requests, batch_size=batch_size)
+        judgments = _journaled_responses(judge, judge_requests, batch_size=batch_size,
+                                         tolerate_failures=tolerate)
         grades = {}
         for slot, judgment in zip(judge_slots, judgments):
             grades[slot] = parse_grade(judgment) if judgment is not None else incomplete_grade("judge_incomplete")

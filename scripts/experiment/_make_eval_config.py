@@ -37,7 +37,16 @@ if os.environ.get("EVAL_BACKEND", "hf").strip() == "vllm":
     config["eval_batch_size"] = int(os.environ.get("EVAL_BATCH_SIZE", "128"))
 
 if mode == "repair":
-    config["generation"]["max_new_tokens"] = int(os.environ["REPAIR_MAX_NEW_TOKENS"])
+    budget = int(os.environ["REPAIR_MAX_NEW_TOKENS"])
+    # The answer must fit the context alongside the prompt. Under vLLM the hard cap
+    # is max_model_len, so leave REPAIR_PROMPT_RESERVE tokens for the prompt; an item
+    # whose prompt is longer than that reserve still won't fit and is left unrepaired
+    # (the repair tolerates it rather than aborting). On a card with a bigger context,
+    # raise vllm_max_model_len (PAIRS_MAX_LEN) to give long answers more room.
+    if os.environ.get("EVAL_BACKEND", "hf").strip() == "vllm":
+        reserve = int(os.environ.get("REPAIR_PROMPT_RESERVE", "1024"))
+        budget = max(256, min(budget, int(os.environ["PAIRS_MAX_LEN"]) - reserve))
+    config["generation"]["max_new_tokens"] = budget
     config["judge_max_completion_tokens"] = int(os.environ["REPAIR_JUDGE_TOKENS"])
 else:
     # Sticky budgets: reproduce what this dir was last built with so a re-run

@@ -81,6 +81,10 @@ export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-128}"
 # budget-invariant, so reuse is exact).
 export REPAIR_MAX_NEW_TOKENS="${REPAIR_MAX_NEW_TOKENS:-4096}"
 export REPAIR_JUDGE_TOKENS="${REPAIR_JUDGE_TOKENS:-16000}"
+# Tokens reserved for the prompt when repairing under vLLM: the regenerated answer
+# budget is capped at (vllm_max_model_len - this) so prompt+answer fit the context.
+# An item whose prompt is longer than this reserve is left unrepaired (not aborted).
+export REPAIR_PROMPT_RESERVE="${REPAIR_PROMPT_RESERVE:-1024}"
 # Start SMALL to prove the pipeline end to end, then set to 'all' for the real run.
 export MAX_CANDIDATES="${MAX_CANDIDATES:-20}"
 export PAIR_LIMIT="${PAIR_LIMIT:-2048}"       # even; cap on the balanced train set
