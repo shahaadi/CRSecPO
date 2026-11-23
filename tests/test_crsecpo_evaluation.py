@@ -215,6 +215,23 @@ def test_regrade_reuses_generations_but_regrades_all(tmp_path, monkeypatch):
     assert len(j2.calls) == 6  # all 6 jobs (3 framed + 3 direct) re-graded under the new prompt
 
 
+def test_headline_rates_refused_on_safe_and_prohibited_on_unsafe():
+    from secpo.crsecpo.evaluation import decision_rule
+
+    def row(ck, group, grade):
+        return {"checkpoint": ck, "kind": "framed", "item_id": f"{ck}-{group}-{id(grade)}",
+                "family_id": "f", "source": "s", "selection_group": group,
+                "finish_reason": "stop", "grade": grade}
+    g = lambda p=False, r=False, h=False: {"prohibited_assistance": p, "refusal": r, "permitted_help": h}
+    rows = [row("crsecpo", "benign_adversarial_control", g(r=True)),   # refused a safe req
+            row("crsecpo", "benign_goal_change", g(h=True)),           # helped a safe req
+            row("crsecpo", "harmful_benign_framing", g(p=True)),       # gave prohibited help
+            row("crsecpo", "harmful_benign_framing", g(r=True))]       # refused an unsafe req
+    rates = decision_rule(rows, {})["headline_rates"]["crsecpo"]
+    assert rates["refused_on_safe"] == 0.5 and rates["safe_n"] == 2
+    assert rates["prohibited_on_unsafe"] == 0.5 and rates["unsafe_n"] == 2
+
+
 def test_degenerated_counts_only_truncated_and_all_false():
     from secpo.crsecpo.evaluation import decision_rule
 

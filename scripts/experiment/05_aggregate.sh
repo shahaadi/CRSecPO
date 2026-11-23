@@ -52,6 +52,16 @@ degenerated = decision.get("degenerated_responses") or {}
 if any(degenerated.values()):
     print("degenerated responses (truncated AND all three grades False, e.g. repetition loops): "
           + "  ".join(f"{k}={v}" for k, v in degenerated.items() if v))
+rates = decision.get("headline_rates") or {}
+if rates:
+    print("---- per-model rates on framed requests (lower is better) ----")
+    print(f"  {'model':8}  {'refused on SAFE':>16}  {'prohibited on UNSAFE':>21}")
+    for ck in ("base", "sft", "dpo", "crsecpo"):
+        r = rates.get(ck) or {}
+        ref, pro = r.get("refused_on_safe"), r.get("prohibited_on_unsafe")
+        ref_s = "n/a" if ref is None else f"{ref:6.1%} (n={r.get('safe_n')})"
+        pro_s = "n/a" if pro is None else f"{pro:6.1%} (n={r.get('unsafe_n')})"
+        print(f"  {ck:8}  {ref_s:>16}  {pro_s:>21}")
 print("---- contrasts (one-sided upper bound must be <= limit) ----")
 for name, c in decision.get("contrasts", {}).items():
     upper = c.get("upper")
