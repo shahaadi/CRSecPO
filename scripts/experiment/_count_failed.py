@@ -18,6 +18,9 @@ if path.exists():
         if not line.strip():
             continue
         row = json.loads(line)
-        if row.get("finish_reason") != "stop" or (row.get("grade") or {}).get("status") in FAILED_GRADES:
+        status = (row.get("grade") or {}).get("status")
+        if status == "degenerate_repetition":
+            continue  # manually resolved as a non-response; not a failure, do not re-repair it
+        if row.get("finish_reason") != "stop" or status in FAILED_GRADES:
             count += 1
 print(count)

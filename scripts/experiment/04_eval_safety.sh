@@ -85,16 +85,40 @@ run_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   cp -f "${cfg}" "${applied}"
 }
 
+common_budget () {  # the single victim budget every checkpoint must end at, so aggregate accepts them
+  if [ "${EVAL_BACKEND:-hf}" = "vllm" ]; then
+    local cap=$(( PAIRS_MAX_LEN - REPAIR_PROMPT_RESERVE ))
+    if [ "${REPAIR_MAX_NEW_TOKENS}" -lt "${cap}" ]; then echo "${REPAIR_MAX_NEW_TOKENS}"; else echo "${cap}"; fi
+  else
+    echo "${REPAIR_MAX_NEW_TOKENS}"
+  fi
+}
+dir_budget () {  # the max_new_tokens recorded in a dir's protocol.json ("" if none)
+  [ -f "$1/protocol.json" ] || { echo ""; return; }
+  python -c "import json,sys; print(json.load(open(sys.argv[1]+'/protocol.json'))['generation_config'].get('max_new_tokens',''))" "$1"
+}
+
 repair_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   local ck="$1" adapter="$2"
   local out="${EVAL_DIR}/${ck}"
   [ -s "${out}/results.jsonl" ] || return 0
-  local failed; failed="$(count_failed "${out}")"
-  if [ "${failed}" = "0" ]; then
-    echo "    ${ck}: all items evaluated; nothing to repair"
+  local failed target current
+  failed="$(count_failed "${out}")"
+  target="$(common_budget)"
+  current="$(dir_budget "${out}")"
+  # Every checkpoint must end at the SAME victim budget or the aggregate rejects the
+  # run ("different frozen evaluation protocols"). So repair runs when there are
+  # failures OR when this dir is still at a different budget; a 0-failure checkpoint
+  # already at the common budget is left untouched.
+  if [ "${failed}" = "0" ] && [ "${current}" = "${target}" ]; then
+    echo "    ${ck}: complete and at the common budget (${target}); nothing to do"
     return 0
   fi
-  echo "    ${ck}: ${failed} failed item(s); regenerating ONLY those at ${REPAIR_MAX_NEW_TOKENS} tok (reusing the rest)"
+  if [ "${failed}" = "0" ]; then
+    echo "    ${ck}: aligning to the common budget ${target} (was ${current:-?}); re-keys finished answers, no regeneration"
+  else
+    echo "    ${ck}: ${failed} failed item(s); regenerating those + aligning to the common budget ${target} (reusing the rest)"
+  fi
   local cfg; cfg="$(make_eval_config "${ck}" "${adapter}" repair)"
   local repair="${out}.repair"; rm -rf "${repair}"
   # The repair writes to a SEPARATE dir and only reads the original (via adopt). The
