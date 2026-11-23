@@ -17,6 +17,7 @@ you get both: working hard links and disconnect-survival, with nothing to do.
 ```bash
 cd scripts/experiment
 bash 00_setup.sh          # install, HF login, download the pinned Llama
+bash 00b_filter_pairs.sh  # OPTIONAL: API-validate pairs, write filtered splits (needs OPENAI_API_KEY)
 bash 01_generate_pairs.sh # train + validation preference pairs (NOT test); replays if present
 bash reuse_pairs.sh       # fold train+validation pairs into one set (no regeneration)
 bash 02_freeze_pairs.sh   # one balanced 50/50 safe-vs-harmful train set
@@ -29,6 +30,21 @@ bash 05_aggregate.sh      # contrasts + decision, PRINTED in the cell (over-refu
 the same candidates and existing journals **replays them instead of
 regenerating**. `reuse_pairs.sh` then merges those two into `merged_pairs.jsonl`
 (every row `split=train`), which `02` freezes.
+
+**`00b` (optional pair filter).** A cheap API agent (`OPENAI_FILTER_MODEL`, default
+`gpt-4o-mini`) checks each pair and keeps it only if the `target` is an *equivalent*
+reframing of the `source` AND the safe/unsafe label still holds — calibrated not to
+over-reject sensitive topics and not to accept flipped/off-topic pairs. It writes
+`filtered_splits/{train,validation,test}.jsonl` (+ `*.verdicts.jsonl`); once present,
+`config.sh` points every later stage at them automatically. Resumable and concurrent;
+the key is read only from `OPENAI_API_KEY`.
+
+**Split safe/unsafe generation (prompt v4).** The teacher (combined/chosen) condition
+now gets a label-specific directive — "this request is LEGITIMATE, help fully" for safe
+pairs, "this request is PROHIBITED, decline" for unsafe — so the chosen answers are
+reliably correct for each class instead of depending on the 8B model to re-derive it.
+The student (ordinary) and rubric-only conditions never see the label, so the model
+must still generalize from the framing alone.
 
 Edit **`config.sh`** first — it holds every path, the pinned model id/revision,
 the compute knobs, and is sourced by all stages.
@@ -43,7 +59,10 @@ import os; os.environ["HF_TOKEN"] = "hf_..."   # a token for the gated Llama lic
 from google.colab import userdata
 os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")  # never written to disk
 os.environ["OPENAI_JUDGE_MODEL"] = "gpt-5-mini"                 # a cheap reasoning-capable model
+os.environ["OPENAI_FILTER_MODEL"] = "gpt-4o-mini"              # cheap classifier for 00b pair filtering
 !cd CRSecPO/scripts/experiment && bash 00_setup.sh
+# Optional: validate pairs and write filtered splits that later stages use automatically.
+!cd CRSecPO/scripts/experiment && bash 00b_filter_pairs.sh
 # run MAX_CANDIDATES=20 first to prove the pipeline, then set it to 'all':
 !cd CRSecPO/scripts/experiment && MAX_CANDIDATES=20 bash 01_generate_pairs.sh
 !cd CRSecPO/scripts/experiment && bash reuse_pairs.sh && bash 02_freeze_pairs.sh && bash 03_train.sh

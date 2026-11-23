@@ -18,6 +18,8 @@ export TOKENIZER_REVISION="${TOKENIZER_REVISION:-$MODEL_REVISION}"
 
 # ---- data (the 70/10/20 preview splits already in the repo) ----
 export SPLIT_DIR="${SPLIT_DIR:-${REPO_ROOT}/data/crsecpo_preview}"
+# The RAW splits, before any API filtering. 00b reads these and writes filtered ones.
+export ORIG_SPLIT_DIR="${SPLIT_DIR}"
 export TRAIN_CANDIDATES="${SPLIT_DIR}/train.jsonl"
 export VAL_CANDIDATES="${SPLIT_DIR}/validation.jsonl"
 export TEST_CANDIDATES="${SPLIT_DIR}/test.jsonl"
@@ -54,6 +56,15 @@ export TRAIN_OUT="${WORK}/checkpoints"        # per-method adapters land in $TRA
 export EVAL_DIR="${WORK}/eval"                # per-checkpoint safety runs
 export AGG_DIR="${WORK}/aggregate"
 export CFG_DIR="${WORK}/configs"              # generated configs
+export FILTERED_DIR="${WORK}/filtered_splits" # 00b writes API-validated splits here
+# Once 00b has produced filtered splits, every later stage uses them automatically.
+if [ -s "${FILTERED_DIR}/train.jsonl" ]; then
+  SPLIT_DIR="${FILTERED_DIR}"
+  TRAIN_CANDIDATES="${SPLIT_DIR}/train.jsonl"
+  VAL_CANDIDATES="${SPLIT_DIR}/validation.jsonl"
+  TEST_CANDIDATES="${SPLIT_DIR}/test.jsonl"
+  echo "[config] using API-filtered splits in ${FILTERED_DIR}"
+fi
 
 # ---- compute knobs ----
 # Reduce CUDA allocator fragmentation (frees reserved-but-unallocated memory);
@@ -67,6 +78,10 @@ export USE_JUDGE="${USE_JUDGE:-0}"
 # Stage-4 grading judge. Empty = local 8B judge. Set to a cheap OpenAI model
 # (e.g. gpt-4o-mini) to grade via API -- also set OPENAI_API_KEY in the env.
 export OPENAI_JUDGE_MODEL="${OPENAI_JUDGE_MODEL:-}"
+# Stage-0b pair filter (validates that each target is an equivalent reframing of its
+# source and keeps the safe/unsafe label). A cheap classifier is plenty -- gpt-4o-mini.
+export OPENAI_FILTER_MODEL="${OPENAI_FILTER_MODEL:-gpt-4o-mini}"
+export FILTER_CONCURRENCY="${FILTER_CONCURRENCY:-8}"
 # Stage-4 answer generation engine. 'vllm' batches all test prompts through one
 # vLLM engine (base + LoRA adapters), far faster than 'hf' (one prompt at a time).
 # Outputs differ numerically from HF, so each engine keeps its own journal/identity.
