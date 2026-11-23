@@ -85,6 +85,10 @@ export REPAIR_JUDGE_TOKENS="${REPAIR_JUDGE_TOKENS:-16000}"
 # budget is capped at (vllm_max_model_len - this) so prompt+answer fit the context.
 # An item whose prompt is longer than this reserve is left unrepaired (not aborted).
 export REPAIR_PROMPT_RESERVE="${REPAIR_PROMPT_RESERVE:-1024}"
+# Set EVAL_REGRADE=1 to re-grade every checkpoint with the CURRENT judge prompt,
+# reusing the existing generations (no regeneration). Use after editing the judge
+# rubric/prompt: run `EVAL_REGRADE=1 bash 04_eval_safety.sh` then `bash 05_aggregate.sh`.
+export EVAL_REGRADE="${EVAL_REGRADE:-0}"
 # Start SMALL to prove the pipeline end to end, then set to 'all' for the real run.
 export MAX_CANDIDATES="${MAX_CANDIDATES:-20}"
 export PAIR_LIMIT="${PAIR_LIMIT:-2048}"       # even; cap on the balanced train set

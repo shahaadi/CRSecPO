@@ -110,9 +110,12 @@ repair_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   # run ("different frozen evaluation protocols"). So repair runs when there are
   # failures OR when this dir is still at a different budget; a 0-failure checkpoint
   # already at the common budget is left untouched.
-  if [ "${failed}" = "0" ] && [ "${current}" = "${target}" ]; then
+  if [ "${EVAL_REGRADE:-0}" != "1" ] && [ "${failed}" = "0" ] && [ "${current}" = "${target}" ]; then
     echo "    ${ck}: complete and at the common budget (${target}); nothing to do"
     return 0
+  fi
+  if [ "${EVAL_REGRADE:-0}" = "1" ]; then
+    echo "    ${ck}: re-grading with the current judge prompt, reusing generations (no regeneration)"
   fi
   if [ "${failed}" = "0" ]; then
     echo "    ${ck}: aligning to the common budget ${target} (was ${current:-?}); re-keys finished answers, no regeneration"
@@ -142,7 +145,18 @@ repair_ck () {  # $1 = checkpoint label, $2 = adapter_dir ("" for base)
   fi
 }
 
-eval_ck () { run_ck "$1" "$2"; repair_ck "$1" "$2"; backup_work; }
+eval_ck () {
+  # EVAL_REGRADE re-grades existing dirs with the current judge prompt; it adopts the
+  # generations into a fresh dir (new protocol), so run_ck's replay (which would see a
+  # judge-template mismatch and stop) is skipped and only repair_ck's adopt runs.
+  if [ "${EVAL_REGRADE:-0}" = "1" ]; then
+    echo "--- safety: $1 (re-grade) ---"
+  else
+    run_ck "$1" "$2"
+  fi
+  repair_ck "$1" "$2"
+  backup_work
+}
 
 eval_ck base    ""
 eval_ck sft     "${TRAIN_OUT}/sft"
