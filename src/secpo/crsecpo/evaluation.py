@@ -217,10 +217,67 @@ def _journaled_responses(journal, requests, *, batch_size=None):
     return responses
 
 
+def _adopt_prior_responses(adopt_from, destination, checkpoints, candidates, generation_config, seed):
+    """Seed a fresh eval dir with a prior run's reusable responses before journaling.
+
+    Greedy (temperature 0) generations that FINISHED (finish_reason "stop") are
+    budget-invariant -- raising max_new_tokens cannot change them -- so they are
+    re-keyed under the new generation config and replayed instead of regenerated.
+    Truncated ("length") generations are left out, so they regenerate at the new
+    (larger) budget. Judge grades that resolved cleanly are copied verbatim (the
+    judge request is unchanged for an unchanged answer); unresolved grades are left
+    out so they are re-asked. Net effect: only the failed items are recomputed.
+    """
+    from .prompts import digest
+    from .inference import GenerationConfig
+    adopt_from = Path(adopt_from)
+    protocol_file = adopt_from / "protocol.json"
+    if not protocol_file.exists():
+        return
+    old_generation = GenerationConfig(**json.loads(protocol_file.read_text(encoding="utf-8"))["generation_config"])
+    norm = lambda request: json.loads(json.dumps(request, allow_nan=False))
+
+    def built(backend, target, label, kind, row, config):
+        request = _request(backend, [{"role": "user", "content": target}], config, seed, "evaluation_" + kind)
+        request["sample_id"] = _hash([label, kind, row["item_id"]])
+        return norm(request)
+
+    # 1. Carry over judge grades that resolved cleanly; the request is identical for
+    #    an unchanged answer, so copying the attempt verbatim replays the grade.
+    old_judge = adopt_from / "judge_requests.jsonl"
+    if old_judge.exists():
+        kept = [entry for entry in load_jsonl(old_judge)
+                if entry.get("status") == "ok"
+                and parse_grade(entry["response"]).get("status") in ("resolved", "unknown")]
+        if kept:
+            atomic_write_jsonl(kept, destination / "judge_requests.jsonl")
+
+    # 2. Re-key every completed generation under the new budget so it replays; drop
+    #    the truncated/missing ones so they regenerate at the larger budget.
+    for label, backend in checkpoints.items():
+        name = "generation_" + _hash(label)[:16] + ".jsonl"
+        old_generation_journal = adopt_from / name
+        if not old_generation_journal.exists():
+            continue
+        by_id = {entry["request_id"]: entry["response"]
+                 for entry in load_jsonl(old_generation_journal) if entry.get("status") == "ok"}
+        seeded = []
+        for kind, target, row in _evaluation_jobs(candidates, label):
+            response = by_id.get(digest(built(backend, target, label, kind, row, old_generation)))
+            if response is None or response.get("finish_reason") != "stop":
+                continue
+            request = built(backend, target, label, kind, row, generation_config)
+            seeded.append({"request_id": digest(request), "request": request,
+                           "status": "ok", "response": response, "elapsed_seconds": 0.0})
+        if seeded:
+            atomic_write_jsonl(seeded, destination / name)
+
+
 def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, Any],
                    judge_backend: Any, output_dir: str | Path, *, rubric: str,
                    generation_config: Any, judge_config: Any | None = None,
-                   seed: int = 0, batch_size: int | None = None) -> dict[str, Any]:
+                   seed: int = 0, batch_size: int | None = None,
+                   adopt_from: str | Path | None = None) -> dict[str, Any]:
     """Generate direct harmful sources once/checkpoint and every retained rewrite.
 
     Backends are callables(request)->{text,finish_reason}, exposing spec/tokenizer.
@@ -247,6 +304,8 @@ def run_evaluation(rows: Sequence[Mapping[str, Any]], checkpoints: Mapping[str, 
     }
     protocol["protocol_sha256"] = _hash(protocol)
     protocol_path = _claim_evaluation_protocol(destination, protocol)
+    if adopt_from is not None:
+        _adopt_prior_responses(adopt_from, destination, checkpoints, candidates, generation_config, seed)
     results = []
     judge = JournalBackend(judge_backend, destination / "judge_requests.jsonl")
     journals = [judge]
@@ -1029,10 +1088,14 @@ def _backend_from_config(config: Mapping[str, Any], *, judge: bool = False):
         if provider != "openai":
             raise ValueError(f"unsupported judge provider: {provider!r}")
         from .openai_judge import OpenAIJudgeBackend
-        # The adapter uses its own generous max_completion_tokens (room for a
-        # reasoning model's hidden tokens); the local judge_generation sizes do
-        # not apply to an API model.
-        return OpenAIJudgeBackend(config[key]["model"])
+        # The API judge uses its own generous max_completion_tokens (room for a
+        # reasoning model's hidden tokens); the local judge_generation sizes do not
+        # apply. This budget is NOT part of the judge fingerprint, so raising it to
+        # re-grade a truncated response does not change the protocol or the request
+        # digest -- resolved grades still replay, only the failed ones are re-asked.
+        budget = config.get("judge_max_completion_tokens")
+        options = {"max_completion_tokens": int(budget)} if budget else {}
+        return OpenAIJudgeBackend(config[key]["model"], **options)
     spec = ModelSpec(**config[key])
     adapter = None if judge else config.get("adapter_path")
     # Opt-in batched vLLM victim generation (base or LoRA). The judge never uses it.
@@ -1139,6 +1202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     safety.add_argument("--input", type=Path, required=True)
     safety.add_argument("--checkpoint", choices=("base", "sft", "dpo", "crsecpo", "rubric_only", "released"), required=True)
     safety.add_argument("--output-dir", type=Path, required=True)
+    safety.add_argument("--adopt-completed-from", type=Path, default=None,
+        help="A prior eval dir whose finished generations and resolved grades to reuse; only the "
+             "truncated/failed items are regenerated (output-dir must be fresh).")
     aggregate = sub.add_parser("aggregate", help="Combine sequential runs; no models loaded")
     aggregate.add_argument("--run-dir", type=Path, action="append", required=True)
     aggregate.add_argument("--input", type=Path, required=True)
@@ -1226,7 +1292,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = run_evaluation(rows, {args.checkpoint: backend}, judge, args.output_dir,
                 rubric=config.get("rubric", RUBRIC), generation_config=decoding, seed=seed,
                 judge_config=GenerationConfig(**config.get("judge_generation", {"temperature": 0})),
-                batch_size=config.get("eval_batch_size"))
+                batch_size=config.get("eval_batch_size"), adopt_from=args.adopt_completed_from)
             print(json.dumps({"output_dir": str(args.output_dir), "joint_claim": report["joint_claim"]}))
         else:
             benchmark = load_json_records(args.input)

@@ -74,6 +74,13 @@ export EVAL_BACKEND="${EVAL_BACKEND:-vllm}"
 # How many generations/grades to journal per chunk during stage-4 eval (vLLM path):
 # a mid-run disconnect loses at most one chunk, then resumes. Bigger = fewer flushes.
 export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-128}"
+# Stage-4 repair budgets. After the normal eval, 04 regenerates ONLY the answers
+# that truncated (finish_reason=length) at this larger victim budget, and re-grades
+# ONLY the answers whose judge call truncated/erred with this larger judge budget --
+# reusing every answer/grade that already succeeded (completed greedy answers are
+# budget-invariant, so reuse is exact).
+export REPAIR_MAX_NEW_TOKENS="${REPAIR_MAX_NEW_TOKENS:-4096}"
+export REPAIR_JUDGE_TOKENS="${REPAIR_JUDGE_TOKENS:-16000}"
 # Start SMALL to prove the pipeline end to end, then set to 'all' for the real run.
 export MAX_CANDIDATES="${MAX_CANDIDATES:-20}"
 export PAIR_LIMIT="${PAIR_LIMIT:-2048}"       # even; cap on the balanced train set

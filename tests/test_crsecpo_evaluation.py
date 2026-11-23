@@ -116,6 +116,46 @@ def test_batched_path_matches_sequential_and_resumes(tmp_path):
     assert len(batched_model.calls) == gen_calls and len(batched_judge.calls) == judge_calls
 
 
+class BudgetBackend(Backend):
+    """Victim whose answer 'truncates' (finish=length) when the item needs more
+    tokens than the request budget; a completed answer is identical at any budget."""
+
+    def __init__(self, need):
+        super().__init__()
+        self.need = need
+
+    def __call__(self, request):
+        self.calls.append(request)
+        content = request["messages"][0]["content"]
+        if self.need.get(content, 1) > request["max_new_tokens"]:
+            return {"text": "partial<eot>", "answer_text": "partial", "finish_reason": "length"}
+        return {"text": f"ok:{content}<eot>", "answer_text": f"ok:{content}", "finish_reason": "stop"}
+
+
+def test_adopt_reuses_completed_and_regenerates_only_truncated(tmp_path):
+    rows = [candidate(index, target=f"framed request {index}", source=f"direct-{index}",
+                       family_id=f"family{index}") for index in range(4)]
+    need = {"framed request 0": 50}  # only this one needs more than the small budget
+    judge_config = GenerationConfig(16, 0.0, 0.95)  # fixed across runs, as the real pipeline keeps it
+    small, judge = BudgetBackend(need), Backend("judge", judge=True)
+    run_evaluation(rows, {"base": small}, judge, tmp_path / "v1",
+                   rubric="frozen", generation_config=GenerationConfig(10, 0.0, 0.95), judge_config=judge_config)
+    v1 = load_json_records(tmp_path / "v1" / "results.jsonl")
+    truncated = [row for row in v1 if row["finish_reason"] == "length"]
+    assert len(truncated) == 1 and truncated[0]["kind"] == "framed"
+
+    big, judge2 = BudgetBackend(need), Backend("judge", judge=True)
+    run_evaluation(rows, {"base": big}, judge2, tmp_path / "v2",
+                   rubric="frozen", generation_config=GenerationConfig(100, 0.0, 0.95),
+                   judge_config=judge_config, adopt_from=tmp_path / "v1")
+    # Exactly the one truncated generation is regenerated; the other seven are adopted.
+    assert len(big.calls) == 1
+    # Exactly the one newly-completed answer is judged; the seven resolved grades are adopted.
+    assert len(judge2.calls) == 1
+    v2 = load_json_records(tmp_path / "v2" / "results.jsonl")
+    assert len(v2) == len(v1) == 8 and all(row["finish_reason"] == "stop" for row in v2)
+
+
 def test_truncated_generation_never_becomes_safe(tmp_path):
     model, judge = Backend(truncate=True), Backend("judge", judge=True)
     summary = run_evaluation([candidate()], {"base": model}, judge, tmp_path,
