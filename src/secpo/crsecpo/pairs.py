@@ -263,7 +263,7 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
                    seed: int = 0, deployment_system: str = "",
                    output_path: str | Path | None = None,
                    outcomes_path: str | Path | None = None, backend_identity=None, output_retries=0,
-                   judge=True):
+                   judge=True, conditions=("ordinary", "combined")):
     """Return (accepted pairs, all outcomes), atomically exporting completed runs.
 
     Wrap ``backend`` in JournalBackend for per-request restart without resampling.
@@ -289,7 +289,7 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
         outcome = {**row, "accepted": False, "status": "generation_error",
                    "generations": generations, "judgments": judgments,
                    "completion_terminator": terminator, "max_output_retries": output_retries}
-        for condition in ("ordinary", "combined"):
+        for condition in conditions:
             request = make_request(answer_messages(candidate, condition, deployment_system=deployment_system),
                 tokenizer=tokenizer, model_spec=model_spec, config=generation_config,
                 seed=_seed(seed, candidate["id"], condition), kind=condition,
@@ -299,6 +299,12 @@ def generate_pairs(candidates, *, backend, tokenizer, model_spec: ModelSpec,
             generations[condition] = result
             if parsed is not None:
                 completions[condition], answers[condition] = parsed
+        if "combined" not in conditions:
+            # Student-only pre-pass (optimization): journal the ordinary answers so a later
+            # both-conditions run on a subset replays them; form no pairs here.
+            outcome["status"] = "student_only" if "ordinary" in completions else "generation_error"
+            outcomes.append(outcome)
+            continue
         if len(completions) == 2:
             if judge:
                 for order, messages in judging_orders(candidate["target"], answers["ordinary"],
@@ -421,13 +427,16 @@ def generate_pairs_batched(candidates, *, journal, backend=None, start_backend=N
             failed.update(journal.record_batch(batch[start:start + chunk_size], backend.generate_many))
 
     counts = _collection_errors(outcomes)
+    # A student-only pre-pass (conditions without "combined") intentionally forms no pairs,
+    # so the "no accepted pair / no judgment" aborts below do not apply to it.
+    both = "combined" in kwargs.get("conditions", ("ordinary", "combined"))
     for stage in ("generation", "judgment"):
         requests = counts[f"{stage}_requests"]
         errors = counts[f"{stage}_errors"]
         if requests and errors == requests:
             raise RuntimeError(f"vLLM collection failed: {errors}/{requests} {stage} requests "
                                f"produced no usable results. Inspect {journal.path}.")
-    if kwargs.get("judge", True):
+    if kwargs.get("judge", True) and both:
         if not counts["judgment_requests"]:
             raise RuntimeError(f"vLLM collection failed: no candidate had two usable answers "
                                f"({counts['generation_errors']}/{counts['generation_requests']} generation errors). "
@@ -436,7 +445,7 @@ def generate_pairs_batched(candidates, *, journal, backend=None, start_backend=N
             raise RuntimeError(f"vLLM collection failed: no candidate had two valid judgments "
                                f"({counts['judgment_errors']}/{counts['judgment_requests']} judgment errors). "
                                f"Inspect {journal.path}.")
-    elif not any(row["accepted"] for row in outcomes):
+    elif both and not any(row["accepted"] for row in outcomes):
         raise RuntimeError(f"vLLM collection failed: no candidate produced two differing answers "
                            f"({counts['generation_errors']}/{counts['generation_requests']} generation errors). "
                            f"Inspect {journal.path}.")
@@ -465,6 +474,10 @@ def main(argv=None):
                         help="Skip the preference judge: accept chosen=combined/rejected=ordinary "
                              "whenever the two answers differ (relies on combined being generally better)")
     parser.set_defaults(judge=True)
+    parser.add_argument("--conditions", choices=("both", "ordinary"), default="both",
+                        help="both: generate ordinary+combined and form pairs (default). "
+                             "ordinary: student-only pre-pass that journals the ordinary answers "
+                             "(forms no pairs) so a later both-conditions run on a subset replays them")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--judge-max-new-tokens", type=int, default=256)
@@ -480,6 +493,7 @@ def main(argv=None):
     parser.add_argument("--batch-size", type=int, default=256,
                         help="vLLM requests per journaled engine batch")
     args = parser.parse_args(argv)
+    args.conditions = ("ordinary", "combined") if args.conditions == "both" else ("ordinary",)
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if not math.isfinite(args.vllm_timeout_seconds) or args.vllm_timeout_seconds <= 0:
@@ -552,7 +566,11 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
         "prompt_version": PROMPT_VERSION,
         "scheduled_ids": [row["id"] for row in rows[:args.max_candidates]],
         "deferred_ids": [row["id"] for row in rows[args.max_candidates:]],
-        "maximum_distinct_requests": (2 if not args.judge else 4) * min(len(rows), args.max_candidates)}
+        "maximum_distinct_requests": (len(args.conditions)
+            + (2 if (args.judge and len(args.conditions) == 2) else 0)) * min(len(rows), args.max_candidates)}
+    # Only recorded when non-default, so existing both-conditions manifests compare unchanged.
+    if list(args.conditions) != ["ordinary", "combined"]:
+        manifest["conditions"] = list(args.conditions)
     if cap_rule is not None:
         manifest["max_candidates_rule"] = cap_rule
     if not args.judge:
@@ -619,7 +637,8 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
                 journal=journal, chunk_size=args.batch_size,
                 tokenizer=tokenizer, model_spec=spec, seed=args.seed,
                 generation_config=generation_config, judge_config=judge_config,
-                backend_identity=backend_identity, output_retries=output_retries, judge=args.judge)
+                backend_identity=backend_identity, output_retries=output_retries, judge=args.judge,
+                conditions=args.conditions)
         with journal.publication_snapshot() as verify_source:
             write_collection_exports(pairs, outcomes, args.output, args.outcomes, manifest=recorded,
                                      verify_source=verify_source)
@@ -633,7 +652,7 @@ def _collect(args, manifest_path, *, old_manifest, lock_journal_file, journal_ex
     pairs, outcomes = generate_pairs(rows, backend=journal,
         tokenizer=backend.tokenizer, model_spec=spec, seed=args.seed,
         generation_config=generation_config,
-        judge_config=judge_config, judge=args.judge)
+        judge_config=judge_config, judge=args.judge, conditions=args.conditions)
     with journal.publication_snapshot() as verify_source:
         write_collection_exports(pairs, outcomes, args.output, args.outcomes, manifest=recorded,
                                  verify_source=verify_source)

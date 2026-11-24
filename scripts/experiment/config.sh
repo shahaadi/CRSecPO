@@ -20,9 +20,11 @@ export TOKENIZER_REVISION="${TOKENIZER_REVISION:-$MODEL_REVISION}"
 export SPLIT_DIR="${SPLIT_DIR:-${REPO_ROOT}/data/crsecpo_preview}"
 # The RAW splits, before any API filtering. 00b reads these and writes filtered ones.
 export ORIG_SPLIT_DIR="${SPLIT_DIR}"
-export TRAIN_CANDIDATES="${SPLIT_DIR}/train.jsonl"
-export VAL_CANDIDATES="${SPLIT_DIR}/validation.jsonl"
-export TEST_CANDIDATES="${SPLIT_DIR}/test.jsonl"
+# Default to the split dir, but respect an explicit override (the general-safety
+# students-first pass points stage 1 at reduced failures_<split>.jsonl candidate files).
+export TRAIN_CANDIDATES="${TRAIN_CANDIDATES:-${SPLIT_DIR}/train.jsonl}"
+export VAL_CANDIDATES="${VAL_CANDIDATES:-${SPLIT_DIR}/validation.jsonl}"
+export TEST_CANDIDATES="${TEST_CANDIDATES:-${SPLIT_DIR}/test.jsonl}"
 
 # ---- outputs ----
 # IMPORTANT: the pipeline's crash-safe writers use hard links (os.link) for the

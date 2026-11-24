@@ -61,7 +61,9 @@ Every stage is idempotent, so a disconnect just resumes.
 | `GSAFE_VAL_SIZE` | `1000` | fixed validation holdout; everything else → train |
 | `GSAFE_REQUIRE_TEACHER_CORRECT` | `1` | also verify the teacher (chosen) is correct on kept rows |
 | `GSAFE_FILTER_MODEL` | `gpt-4o-mini` | OpenAI model for the failure filter |
-| `FILTER_CONCURRENCY` | `8` | concurrent grading calls |
+| `FILTER_CONCURRENCY` | `8` | concurrent grading calls (sync path) |
+| `GSAFE_USE_BATCH` | `0` | `1` grades via the async OpenAI Batch API (opt #2) |
+| `GSAFE_BATCH_POLL_HOURS` | `6` | per-invocation poll budget before the step asks you to re-run |
 | `GSAFE_FORCE_PREP` | `0` | `1` re-prepares splits even if present |
 | `GSAFE_REFILTER` | `0` | `1` re-runs the filter from scratch (re-grades) |
 
@@ -69,3 +71,23 @@ Every stage is idempotent, so a disconnect just resumes.
 answer per *kept* failure). Start with the default `GSAFE_MAX_PER_CLASS=5000` to size the
 cost before setting `all`. Completed grades are cached (`<work>/pairs/filter_grades.jsonl`),
 so reruns never re-charge resolved rows.
+
+## Two speed/cost optimizations (opt-in)
+
+**#1 Students-first generation — `run_students_first.sh` (instead of `run.sh`).**
+Generates only the cheap student (bare-prompt) answer for *all* candidates, grades them,
+and runs the expensive teacher (combined) generation **only on the failures** (`01a_student_pass.sh`
+→ `select_student_failures.py` → normal stage 1 on `failures_<split>.jsonl`). Since the base
+model already handles the majority of prompts, this skips most teacher generations — roughly a
+third off stage-1 wall-clock at full scale (more in token terms, because teacher generations are
+the long ones). The student grades it computes are reused by the later teacher-check (shared
+cache), so nothing is graded twice. Uses a separate journal from the normal stage 1, so there is
+no cross-run journal sharing to worry about. **Validate on a tiny slice first**
+(`GSAFE_MAX_PER_CLASS=20 bash run_students_first.sh`) before a full run — the student-only
+pass uses the new `pairs.py --conditions ordinary` path.
+
+**#2 Batch grading — `GSAFE_USE_BATCH=1`.** Routes all judge calls through the async OpenAI
+Batch API (~50% cheaper, no rate-limit babysitting), at the cost of up-to-24h turnaround. It is
+resumable: the batch id is persisted, so if the grading step exits with "batch still running",
+just re-run that same step/cell later and it polls and retrieves the finished results. Works with
+both `run.sh` and `run_students_first.sh`.
