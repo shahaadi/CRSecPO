@@ -34,21 +34,41 @@ MAPPING = {
     "adversarial_harmful": ("harmful_benign_framing", "prohibited", "unsafe"),
     "adversarial_benign": ("benign_adversarial_control", "permissible", "safe"),
 }
-# Family-hash buckets 0..9 -> split. Keeps variants of one base request together.
-SPLIT_BUCKETS = {**{b: "train" for b in range(8)}, 8: "validation", 9: "test"}
 
 
 def _sha(*parts: str) -> str:
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
-def _bucket(family_id: str) -> int:
-    return int(_sha("split", SEED, family_id)[:8], 16) % 10
-
-
 def _max_per_class() -> float:
     value = os.environ.get("GSAFE_MAX_PER_CLASS", "5000").strip().lower()
     return float("inf") if value in {"all", ""} else int(value)
+
+
+def _holdout(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+def assign_splits(rows):
+    """FIXED-SIZE val/test holdouts, everything else -> train, at the FAMILY level so
+    adversarial variants of one vanilla seed never straddle splits. Deterministic in SEED.
+    This keeps eval tractable even when the train side is the full ~160K adversarial set."""
+    test_cap, val_cap = _holdout("GSAFE_TEST_SIZE", 2000), _holdout("GSAFE_VAL_SIZE", 1000)
+    families: dict[str, list] = {}
+    for row in rows:
+        families.setdefault(row["family_id"], []).append(row)
+    ordered = sorted(families.items(), key=lambda kv: _sha("split", SEED, kv[0]))
+    n_test = n_val = 0
+    for _, members in ordered:
+        if n_test < test_cap:
+            split, n_test = "test", n_test + len(members)
+        elif n_val < val_cap:
+            split, n_val = "validation", n_val + len(members)
+        else:
+            split = "train"
+        for row in members:
+            row["split"] = split
+    return rows
 
 
 def _load_rows():
@@ -93,7 +113,7 @@ def build_candidates():
             "family_id": family_id,
             "source": source,
             "target": target,
-            "split": SPLIT_BUCKETS[_bucket(family_id)],
+            "split": "train",  # replaced by assign_splits() once the full set is known
             "target_policy": policy,
             "selection_group": group,
             "selection_status": "accepted",
@@ -127,6 +147,7 @@ def main():
         return
     out_dir.mkdir(parents=True, exist_ok=True)
     rows, counts, skipped = build_candidates()
+    assign_splits(rows)
     for row in rows:
         _validate(row)
     by_split = {"train": [], "validation": [], "test": []}

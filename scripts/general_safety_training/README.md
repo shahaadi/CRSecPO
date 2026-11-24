@@ -56,7 +56,9 @@ Every stage is idempotent, so a disconnect just resumes.
 |---|---|---|
 | `GSAFE_WORK` | `<repo>/gsafe_out` | work dir (set `/content/gsafe_out` on Colab) |
 | `GSAFE_SPLIT_DIR` | `<repo>/data/wildjailbreak_general` | where the prepared candidate splits go |
-| `GSAFE_MAX_PER_CLASS` | `5000` | cap per class before splitting (`all` = entire set — big cost) |
+| `GSAFE_MAX_PER_CLASS` | `5000` | cap per class before splitting (`all` = entire ~160K adversarial set — big cost) |
+| `GSAFE_TEST_SIZE` | `2000` | FIXED eval holdout (not a %); keeps stage-4 tractable even at full scale |
+| `GSAFE_VAL_SIZE` | `1000` | fixed validation holdout; everything else → train |
 | `GSAFE_REQUIRE_TEACHER_CORRECT` | `1` | also verify the teacher (chosen) is correct on kept rows |
 | `GSAFE_FILTER_MODEL` | `gpt-4o-mini` | OpenAI model for the failure filter |
 | `FILTER_CONCURRENCY` | `8` | concurrent grading calls |

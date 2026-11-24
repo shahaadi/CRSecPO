@@ -28,6 +28,8 @@ export PAIR_LIMIT="${PAIR_LIMIT:-100000}"
 
 # --- failure filter knobs ---
 export GSAFE_MAX_PER_CLASS="${GSAFE_MAX_PER_CLASS:-5000}"      # per class before splitting; 'all' = entire set
+export GSAFE_TEST_SIZE="${GSAFE_TEST_SIZE:-2000}"             # FIXED eval holdout (not a %); keeps stage-4 tractable at full scale
+export GSAFE_VAL_SIZE="${GSAFE_VAL_SIZE:-1000}"              # fixed validation holdout; everything else -> train
 export GSAFE_REQUIRE_TEACHER_CORRECT="${GSAFE_REQUIRE_TEACHER_CORRECT:-1}"
 export GSAFE_FILTER_MODEL="${GSAFE_FILTER_MODEL:-${OPENAI_FILTER_MODEL:-gpt-4o-mini}}"
 export FILTER_CONCURRENCY="${FILTER_CONCURRENCY:-8}"
