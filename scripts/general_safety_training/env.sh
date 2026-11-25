@@ -33,11 +33,6 @@ export GSAFE_VAL_SIZE="${GSAFE_VAL_SIZE:-1000}"              # fixed validation 
 export GSAFE_REQUIRE_TEACHER_CORRECT="${GSAFE_REQUIRE_TEACHER_CORRECT:-1}"
 export GSAFE_FILTER_MODEL="${GSAFE_FILTER_MODEL:-${OPENAI_FILTER_MODEL:-gpt-4o-mini}}"
 export FILTER_CONCURRENCY="${FILTER_CONCURRENCY:-8}"
-# Optimization #2: grade via the async OpenAI Batch API (~50% cheaper, no rate-limit
-# babysitting, up to 24h turnaround). Resumable: re-run the grading step to poll/retrieve.
-export GSAFE_USE_BATCH="${GSAFE_USE_BATCH:-0}"
-export GSAFE_BATCH_POLL_HOURS="${GSAFE_BATCH_POLL_HOURS:-6}"   # per-invocation poll budget before it asks you to re-run
-export GSAFE_JUDGE_MAX_TOKENS="${GSAFE_JUDGE_MAX_TOKENS:-4096}"
 export GSAFE_FORCE_PREP="${GSAFE_FORCE_PREP:-0}"
 export GSAFE_REFILTER="${GSAFE_REFILTER:-0}"
 
